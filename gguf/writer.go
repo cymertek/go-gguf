@@ -1,0 +1,599 @@
+package gguf
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"strings"
+)
+
+// ---------------------------------------------------------------------------
+// StreamWriter — low-memory backend that writes directly to io.WriterAt
+// ---------------------------------------------------------------------------
+
+// StreamWriter writes GGUF files directly to an io.WriterAt, avoiding full in-memory accumulation.
+type StreamWriter struct {
+	w        io.WriterAt     // underlying writer (file, network buffer, etc.)
+	meta     *writerMeta     // accumulated KV entries (in memory — always small)
+	buf8     [8]byte         // reusable 8-byte buffer for writes
+	tensors  []tensorBuf     // queued tensors with pre-computed offsets
+	dataStart uint64         // aligned start of tensor data section
+	totalSize uint64         // total file size after all tensors written
+
+	alignment    uint64
+	headerWritten bool
+	initialized  bool
+}
+
+// writerMeta holds KV entries in memory for writing. Metadata is always small relative to tensors.
+type writerMeta struct {
+	pairs     []KVEntry
+	alignment uint64
+}
+
+func newWriterMeta() *writerMeta {
+	return &writerMeta{
+		pairs:     make([]KVEntry, 0, 32),
+		alignment: defaultAlignment,
+	}
+}
+
+// tensorBuf holds a queued tensor's info and its raw data bytes.
+type tensorBuf struct {
+	info TensorInfo
+	data []byte // nil until WriteTensorData is called
+}
+
+// ---------------------------------------------------------------------------
+// Create — high-level builder for writing GGUF files to any io.Writer
+// ---------------------------------------------------------------------------
+
+// Create creates a new GGUF file writer wrapping the given io.Writer.
+func Create(w io.Writer) *GGUFWriter {
+	var sw *StreamWriter
+	if wa, ok := w.(io.WriterAt); ok {
+		sw = NewStreamWriter(wa)
+	} else {
+		sw = NewStreamWriter(&writerAdapter{w: w})
+	}
+	return &GGUFWriter{sw: sw, meta: sw.meta}
+}
+
+// OpenForWrite creates a GGUF writer for the given file path.
+func OpenForWrite(path string) (*GGUFWriter, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return nil, fmt.Errorf("gguf: create %q: %w", path, err)
+	}
+	w := Create(f)
+	return w, nil
+}
+
+// ConvertName translates tensor names from llama.cpp convention to HuggingFace convention.
+func ConvertName(name string) string {
+	conv := map[string]string{
+		"output.weight":      "lm_head.weight",
+		"token_embd.weight":  "model.embed_tokens.weight",
+		"output_norm.weight": "model.norm.weight",
+	}
+	if r, ok := conv[name]; ok {
+		return r
+	}
+
+	return strings.NewReplacer(
+		"blk.", "model.layers.",
+		".attn_norm.weight", ".input_layernorm.weight",
+		".ffn_down.weight", ".mlp.down_proj.weight",
+		".ffn_gate.weight", ".mlp.gate_proj.weight",
+		".ffn_up.weight", ".mlp.up_proj.weight",
+		".ffn_norm.weight", ".post_attention_layernorm.weight",
+		".attn_q.weight", ".self_attn.q_proj.weight",
+		".attn_k.weight", ".self_attn.k_proj.weight",
+		".attn_v.weight", ".self_attn.v_proj.weight",
+		".attn_output.weight", ".self_attn.o_proj.weight",
+	).Replace(name)
+}
+
+// writerAdapter wraps io.Writer to implement io.WriterAt by buffering.
+type writerAdapter struct {
+	w   io.Writer
+	buf []byte
+	pos int64
+}
+
+func (a *writerAdapter) Write(p []byte) (int, error) {
+	n, err := a.w.Write(p)
+	a.buf = append(a.buf[:a.pos], p...)
+	a.pos += int64(n)
+	return n, err
+}
+
+func (a *writerAdapter) WriteAt(p []byte, off int64) (int, error) {
+	if off+int64(len(p)) > int64(len(a.buf)) {
+		newBuf := make([]byte, off+int64(len(p)))
+		copy(newBuf, a.buf)
+		a.buf = newBuf
+	}
+	n := copy(a.buf[off:], p)
+	return n, nil
+}
+
+// GGUFWriter is a high-level builder for creating new GGUF files.
+type GGUFWriter struct {
+	sw    *StreamWriter
+	meta  *writerMeta // alias to StreamWriter's internal meta
+}
+
+// SetKV adds or replaces a key-value pair in the metadata section.
+func (w *GGUFWriter) SetKV(key string, v Value) error {
+	return w.sw.SetMetadataEntry(KVEntry{Key: key, Value: v})
+}
+
+// GetMetadata returns copies of all KV entries currently queued for writing.
+func (w *GGUFWriter) GetMetadata() []KVEntry {
+	result := make([]KVEntry, len(w.meta.pairs))
+	copy(result, w.meta.pairs)
+	return result
+}
+
+// AddTensor queues a tensor to be written later. Returns the index for WriteTensorData.
+func (w *GGUFWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType) uint64 {
+	idx := w.sw.AddTensor(name, shape, ggmlType)
+	return idx
+}
+
+// NumTensors returns the number of queued tensors.
+func (w *GGUFWriter) NumTensors() int {
+	return len(w.sw.tensors)
+}
+
+// WriteTensorData streams the raw tensor data for a previously queued tensor.
+func (w *GGUFWriter) WriteTensorData(idx uint64, r io.Reader) error {
+	return w.sw.WriteTensorData(idx, r)
+}
+
+// Close flushes header + KV section + tensor metadata and closes the underlying writer.
+func (w *GGUFWriter) Close() (int64, error) {
+	return w.sw.Close()
+}
+
+// ---------------------------------------------------------------------------
+// StreamWriter methods
+// ---------------------------------------------------------------------------
+
+// NewStreamWriter creates a new streaming GGUF writer wrapping an io.WriterAt.
+func NewStreamWriter(w io.WriterAt) *StreamWriter {
+	return &StreamWriter{
+		w:           w,
+		meta:        newWriterMeta(),
+		tensors:     make([]tensorBuf, 0, 16),
+		alignment:   defaultAlignment,
+	}
+}
+
+// SetMetadataEntry adds or replaces a KV entry in the writer's metadata.
+func (w *StreamWriter) SetMetadataEntry(e KVEntry) error {
+	for i := range w.meta.pairs {
+		if w.meta.pairs[i].Key == e.Key {
+			w.meta.pairs[i] = e
+			return nil
+		}
+	}
+	w.meta.pairs = append(w.meta.pairs, e)
+	return nil
+}
+
+// AddTensor queues a tensor for writing.
+func (w *StreamWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType) uint64 {
+	info := TensorInfo{
+		Name:   name,
+		Shape:  shape,
+		GgmlType: ggmlType,
+	}
+
+	idx := uint64(len(w.tensors))
+	w.tensors = append(w.tensors, tensorBuf{info: info})
+
+	// Auto-initialize when first tensor is added
+	if !w.initialized {
+		w.initialized = true
+	}
+
+	return idx
+}
+
+// WriteTensorData streams raw tensor bytes for a previously queued tensor.
+func (w *StreamWriter) WriteTensorData(idx uint64, r io.Reader) error {
+	if int(idx) >= len(w.tensors) {
+		return fmt.Errorf("gguf: tensor index %d out of range", idx)
+	}
+
+	tb := &w.tensors[idx]
+
+	expectedSz := computeDataSize(tb.info)
+	data := make([]byte, expectedSz)
+	n, err := io.ReadFull(r, data)
+	if err != nil {
+		return fmt.Errorf("gguf: read tensor %s data: %w", tb.info.Name, err)
+	}
+	if uint64(n) != expectedSz {
+		return fmt.Errorf("gguf: tensor %s: short write %d/%d bytes", tb.info.Name, n, expectedSz)
+	}
+
+	tb.data = data
+	return nil
+}
+
+// SetAlignment sets the alignment for tensor data section (must be multiple of 8).
+func (w *StreamWriter) SetAlignment(a uint64) {
+	if a == 0 {
+		a = defaultAlignment
+	}
+	w.alignment = a
+	w.meta.alignment = a
+}
+
+// Close writes header + KV section + tensor metadata, then streams tensor data.
+func (w *StreamWriter) Close() (int64, error) {
+	if !w.initialized {
+		return 0, fmt.Errorf("gguf: stream not initialized")
+	}
+
+	var totalWritten int64
+
+	// --- Write header (24 bytes) ---
+	if err := w.writeHeader(); err != nil {
+		return totalWritten, err
+	}
+	totalWritten += 24
+
+	// --- Compute KV section size and write ---
+	kvSize := computeKVSize(w.meta.pairs)
+	tensorMetaSize := computeTensorMetaSize(w.tensors)
+
+	w.dataStart = uint64(24) + kvSize + tensorMetaSize
+	if rem := w.dataStart % defaultAlignment; rem != 0 {
+		w.dataStart += defaultAlignment - rem
+	}
+
+	// Write KV section at offset 24
+	kvOff := int64(24)
+	for _, e := range w.meta.pairs {
+		nw, err := w.writeKVEntry(kvOff, e.Key, e.Value)
+		if err != nil {
+			return totalWritten, fmt.Errorf("gguf: write KV %q: %w", e.Key, err)
+		}
+		kvOff += nw
+		totalWritten += nw
+	}
+
+	// --- Write tensor metadata section at offset kvEnd ---
+	tensorMetaPos := int64(kvOff)
+	for _, tb := range w.tensors {
+		if err := writeTensorMeta(w.w, tensorMetaPos, tb.info); err != nil {
+			return totalWritten, fmt.Errorf("gguf: write tensor meta %s: %w", tb.info.Name, err)
+		}
+		entrySize := int64(8 + len(tb.info.Name) + 4 + len(tb.info.Shape)*8 + 4 + 8)
+		tensorMetaPos += entrySize
+	}
+
+	dataEnd := tensorMetaPos
+	w.totalSize = uint64(dataEnd)
+
+	// --- Write alignment padding between metadata end and data start ---
+	if w.dataStart > uint64(dataEnd) {
+		padLen := int64(w.dataStart - uint64(dataEnd))
+		padBuf := make([]byte, padLen)
+		nw, err := w.w.WriteAt(padBuf, dataEnd) // write at dataEnd (which is dataStart-padLen)
+		if err != nil {
+			return totalWritten, fmt.Errorf("gguf: write alignment padding: %w", err)
+		}
+		totalWritten += int64(nw)
+	}
+
+	// --- Stream tensor data at pre-computed offsets ---
+	pos := w.dataStart
+	for _, tb := range w.tensors {
+		if rem := pos % defaultAlignment; rem != 0 {
+			padLen := int64(defaultAlignment - rem)
+			padBuf := make([]byte, padLen)
+			nw, err := w.w.WriteAt(padBuf, int64(pos))
+			if err != nil {
+				return totalWritten, fmt.Errorf("gguf: write tensor alignment padding: %w", err)
+			}
+			totalWritten += int64(nw)
+			pos += uint64(padLen)
+		}
+
+		if tb.data == nil {
+			return totalWritten, fmt.Errorf("gguf: tensor %s has no data", tb.info.Name)
+		}
+
+		nw, err := w.w.WriteAt(tb.data, int64(pos))
+		if err != nil {
+			return totalWritten, fmt.Errorf("gguf: write tensor %s data: %w", tb.info.Name, err)
+		}
+		totalWritten += int64(nw)
+		pos += uint64(len(tb.data))
+	}
+
+	return totalWritten, nil
+}
+
+// --- Internal helpers ---
+
+func (w *StreamWriter) writeHeader() error {
+	offset := int64(0)
+
+	if _, err := w.w.WriteAt([]byte(Magic), offset); err != nil {
+		return fmt.Errorf("gguf: write magic: %w", err)
+	}
+	offset += 4
+
+	binary.LittleEndian.PutUint32(w.buf8[:], Version3)
+	if _, err := w.w.WriteAt(w.buf8[:4], offset); err != nil {
+		return fmt.Errorf("gguf: write version: %w", err)
+	}
+	offset += 4
+
+	binary.LittleEndian.PutUint64(w.buf8[:], uint64(len(w.tensors)))
+	if _, err := w.w.WriteAt(w.buf8[:], offset); err != nil {
+		return fmt.Errorf("gguf: write nTensors: %w", err)
+	}
+	offset += 8
+
+	binary.LittleEndian.PutUint64(w.buf8[:], uint64(len(w.meta.pairs)))
+	if _, err := w.w.WriteAt(w.buf8[:], offset); err != nil {
+		return fmt.Errorf("gguf: write nKV: %w", err)
+	}
+
+	return nil
+}
+
+func (w *StreamWriter) writeKVEntry(off int64, key string, v Value) (int64, error) {
+	var totalWritten int64
+
+	keyBytes := []byte(key)
+	binary.LittleEndian.PutUint64(w.buf8[:], uint64(len(keyBytes)))
+	if _, err := w.w.WriteAt(w.buf8[:], off); err != nil {
+		return 0, err
+	}
+	totalWritten += 8
+
+	if _, err := w.w.WriteAt(keyBytes, off+8); err != nil {
+		return totalWritten + 8, err
+	}
+	totalWritten += int64(len(keyBytes))
+
+	btypeOff := off + 8 + int64(len(keyBytes))
+	binary.LittleEndian.PutUint32(w.buf8[:], uint32(v.BType))
+	if _, err := w.w.WriteAt(w.buf8[:4], btypeOff); err != nil {
+		return totalWritten, err
+	}
+	totalWritten += 4
+
+	valOff := btypeOff + 4
+
+	switch v.BType {
+	case BTypeBool:
+		b := byte(0)
+		if v.Int != 0 {
+			b = 1
+		}
+		if _, err := w.w.WriteAt([]byte{b}, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten++
+
+	case BTypeUint8:
+		if _, err := w.w.WriteAt([]byte{byte(v.Int)}, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten++
+
+	case BTypeInt8:
+		if _, err := w.w.WriteAt([]byte{byte(v.Int)}, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten++
+
+	case BTypeUint16:
+		buf := make([]byte, 2)
+		binary.LittleEndian.PutUint16(buf, uint16(v.Int))
+		if _, err := w.w.WriteAt(buf, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += 2
+
+	case BTypeInt16:
+		buf := make([]byte, 2)
+		binary.LittleEndian.PutUint16(buf, uint16(v.Int))
+		if _, err := w.w.WriteAt(buf, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += 2
+
+	case BTypeUint32:
+		buf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(buf, uint32(v.Int))
+		if _, err := w.w.WriteAt(buf, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += 4
+
+	case BTypeInt32:
+		buf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(buf, uint32(v.Int))
+		if _, err := w.w.WriteAt(buf, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += 4
+
+	case BTypeFloat32:
+		buf := make([]byte, 4)
+		binary.LittleEndian.PutUint32(buf, math.Float32bits(float32(v.Float)))
+		if _, err := w.w.WriteAt(buf, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += 4
+
+	case BTypeUint64:
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, uint64(v.Int))
+		if _, err := w.w.WriteAt(buf, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += 8
+
+	case BTypeInt64:
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, uint64(v.Int))
+		if _, err := w.w.WriteAt(buf, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += 8
+
+	case BTypeFloat64:
+		buf := make([]byte, 8)
+		binary.LittleEndian.PutUint64(buf, math.Float64bits(v.Float))
+		if _, err := w.w.WriteAt(buf, valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += 8
+
+	case BTypeString:
+		strBuf := []byte(v.Str)
+		binary.LittleEndian.PutUint64(w.buf8[:], uint64(len(strBuf)))
+		if _, err := w.w.WriteAt(w.buf8[:], valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += 8
+		if _, err := w.w.WriteAt(strBuf, valOff+8); err != nil {
+			return totalWritten + 8, err
+		}
+		totalWritten += int64(len(strBuf))
+
+	case BTypeArray:
+		binary.LittleEndian.PutUint32(w.buf8[:4], uint32(v.ElemType))
+		if _, err := w.w.WriteAt(w.buf8[:4], valOff); err != nil {
+			return totalWritten, err
+		}
+		totalWritten += 4
+
+		binary.LittleEndian.PutUint64(w.buf8[:], uint64(v.Int))
+		if _, err := w.w.WriteAt(w.buf8[:], valOff+4); err != nil {
+			return totalWritten + 4, err
+		}
+		totalWritten += 8
+
+		if len(v.Raw) > 0 {
+			nw, err := w.w.WriteAt(v.Raw, valOff+12)
+			if err != nil {
+				return totalWritten + 12, err
+			}
+			totalWritten += int64(nw)
+		}
+
+	default:
+		return totalWritten, fmt.Errorf("gguf: unsupported write type %d", v.BType)
+	}
+
+	return totalWritten, nil
+}
+
+func writeTensorMeta(w io.WriterAt, off int64, info TensorInfo) error {
+	buf8 := make([]byte, 8)
+
+	binary.LittleEndian.PutUint64(buf8, uint64(len(info.Name)))
+	if _, err := w.WriteAt(buf8, off); err != nil {
+		return fmt.Errorf("write tensor name_len: %w", err)
+	}
+
+	nameOff := int64(off + 8)
+	if _, err := w.WriteAt([]byte(info.Name), nameOff); err != nil {
+		return fmt.Errorf("write tensor name: %w", err)
+	}
+
+	slOff := int64(nameOff + int64(len(info.Name)))
+	binary.LittleEndian.PutUint32(buf8[:4], uint32(len(info.Shape)))
+	if _, err := w.WriteAt(buf8[:4], slOff); err != nil {
+		return fmt.Errorf("write shape_len: %w", err)
+	}
+
+	dimOff := int64(slOff + 4)
+	for _, dim := range info.Shape {
+		binary.LittleEndian.PutUint64(buf8, dim)
+		if _, err := w.WriteAt(buf8, dimOff); err != nil {
+			return fmt.Errorf("write dimension: %w", err)
+		}
+		dimOff += 8
+	}
+
+	binary.LittleEndian.PutUint32(buf8[:4], uint32(info.GgmlType))
+	if _, err := w.WriteAt(buf8[:4], dimOff); err != nil {
+		return fmt.Errorf("write ggml_type: %w", err)
+	}
+
+	binary.LittleEndian.PutUint64(buf8, info.Offset)
+	if _, err := w.WriteAt(buf8, dimOff+4); err != nil {
+		return fmt.Errorf("write tensor offset: %w", err)
+	}
+
+	return nil
+}
+
+// computeKVSize computes total wire size of all KV entries.
+func computeKVSize(entries []KVEntry) uint64 {
+	var total uint64
+	for _, e := range entries {
+		total += 8 + uint64(len(e.Key)) + 4 // key_len(8) + key(N) + btype(4)
+
+		switch e.Value.BType {
+		case BTypeString:
+			total += 8 + uint64(len(e.Value.Str))
+		case BTypeArray:
+			total += 12 + uint64(len(e.Value.Raw)) // elem_type(4)+count(8)+raw data
+		default:
+			typeSizes := map[BType]int{
+				BTypeBool:         1,
+				BTypeUint8:        1,
+				BTypeInt8:         1,
+				BTypeUint16:       2,
+				BTypeInt16:        2,
+				BTypeUint32:       4,
+				BTypeInt32:        4,
+				BTypeFloat32:      4,
+				BTypeUint64:       8,
+				BTypeInt64:        8,
+				BTypeFloat64:      8,
+			}
+			total += uint64(typeSizes[e.Value.BType])
+		}
+	}
+	return total
+}
+
+// computeTensorMetaSize computes total wire size of tensor metadata section.
+func computeTensorMetaSize(tensors []tensorBuf) uint64 {
+	var total uint64
+	for _, tb := range tensors {
+		total += 8 + uint64(len(tb.info.Name)) + 4 + uint64(len(tb.info.Shape))*8 + 4 + 8
+	}
+	return total
+}
+
+// computeDataSize computes expected byte size for a tensor's raw data.
+func computeDataSize(info TensorInfo) uint64 {
+	var totalElements uint64 = 1
+	for _, d := range info.Shape {
+		totalElements *= d
+	}
+	blockBytes := info.GgmlType.BlockBytes()
+	elementsPerBlock := info.GgmlType.ElementsPerBlock()
+	if elementsPerBlock == 0 || blockBytes == 0 {
+		return 0
+	}
+	return totalElements * uint64(blockBytes) / uint64(elementsPerBlock)
+}
