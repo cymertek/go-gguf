@@ -9,7 +9,7 @@ A pure Go library for reading and writing [GGUF](https://github.com/ggerganov/gg
 - Buffer pooling — tiered sync.Pool for efficient memory reuse across files and tensors
 
 ```bash
-go get github.com/cymertek/go-gguf/gguf
+go get github.com/cymertek/go-gguf
 ```
 
 ## Quick Start
@@ -21,7 +21,7 @@ package main
 
 import (
     "fmt"
-    "github.com/cymertek/go-gguf/gguf"
+    "github.com/cymertek/go-gguf"
 )
 
 func main() {
@@ -93,6 +93,44 @@ func sum(s []uint64) uint64 {
     }
     return n
 }
+```
+
+#### Custom Shard Distribution Control
+
+You can control which tensors go into each shard based on size, name patterns, or custom logic:
+
+```go
+// Open source file and get all tensors
+src, _ := gguf.Open("model.gguf")
+tensors, _ := src.Tensors()
+
+// Calculate total size for equal distribution
+var totalSize uint64
+for _, t := range tensors {
+    info := t.Info() // Returns safe copy with copied slices
+    totalSize += info.NBytes
+}
+targetPerShard := totalSize / 2
+
+// Distribute tensors based on cumulative size
+shard1Tensors := []*gguf.Tensor{}
+shard2Tensors := []*gguf.Tensor{}
+cumulativeSize := uint64(0)
+
+for _, t := range tensors {
+    info := t.Info()
+    
+    if cumulativeSize < targetPerShard {
+        shard1Tensors = append(shard1Tensors, t)
+        cumulativeSize += info.NBytes
+    } else {
+        shard2Tensors = append(shard2Tensors, t)
+    }
+}
+
+// Write shards with custom distribution
+writeShard("shard-00001-of-00002.gguf", metaEntries, shard1Tensors)
+writeShard("shard-00002-of-00002.gguf", nil, shard2Tensors) // No metadata in data shards
 ```
 
 ### Writing a GGUF File
@@ -185,7 +223,7 @@ dst.Close()
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `(*Tensor).Info()` | `func (t *Tensor) Info() TensorInfo` | Return tensor metadata (name, shape, type, offset, nbytes). |
+| `(*Tensor).Info()` | `func (t *Tensor) Info() TensorInfo` | Return tensor metadata as a safe copy with copied slices. Access `.NBytes` for size in bytes, `.Shape` for dimensions, etc. Modifications to the returned struct won't affect the original tensor. |
 | `(*Tensor).ReadAt()` | `func (t *Tensor) ReadAt(dst []byte, off int64) (int, error)` | Read bytes from this tensor at the given offset. Uses per-tensor cache to avoid disk I/O for repeated reads. |
 | `(*Tensor).Bytes()` | `func (t *Tensor) Bytes() ([]byte, error)` | Read entire tensor data into a newly allocated slice. |
 | `(*Tensor).Data()` | `func (t *Tensor) Data() (io.ReaderAt, error)` | Return an io.ReaderAt positioned at this tensor's raw data in the file. |

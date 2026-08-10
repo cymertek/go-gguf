@@ -329,8 +329,15 @@ func dequantQ6K(data []byte) ([]float32, error) {
 	return out, nil
 }
 
-// Dequant converts quantized tensor data to float32 values.
-// Supported types: F32, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
+// Dequant converts raw quantized tensor bytes to a []float32 slice of de-quantized values.
+// Supported types: F32, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K (S and L variants), Q4_K, Q5_K, Q6_K, NVFP4.
+// Returns an error if the data length is not a multiple of the block size for the given type,
+// or if the type is unsupported. The returned slice must not be modified by the caller.
+//
+// Example -- dequantize a Q8_0 tensor:
+//
+//	data := tensor.Bytes()  // raw bytes from gguf.Tensor
+//	f32s, err := gguf.Dequant(data, gguf.GgmlQ8_0)
 func Dequant(data []byte, t GgmlType) ([]float32, error) {
 	switch t {
 	case GgmlF32:
@@ -358,8 +365,10 @@ func Dequant(data []byte, t GgmlType) ([]float32, error) {
 	}
 }
 
-// Requant converts float32 data to quantized raw bytes for the given target type.
-// Supported types: F32, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
+// Requant converts a []float32 slice to raw quantized bytes for the given target type.
+// Supported types: F32, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K (S and L variants), Q4_K, Q5_K, Q6_K, NVFP4.
+// Returns an error if the target type is unsupported. The returned byte slice must not be modified
+// by the caller after this returns. Use [Requantize] for a more descriptive alias.
 func Requant(data []float32, targetType GgmlType) ([]byte, error) {
 	switch targetType {
 	case GgmlF32:
@@ -387,8 +396,10 @@ func Requant(data []float32, targetType GgmlType) ([]byte, error) {
 	}
 }
 
-// Requantize converts float32 values back to quantized raw bytes for the given target type.
-// Supported types: F32, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K.
+// Requantize converts a []float32 slice back to quantized raw bytes for the given target type.
+// This is an alias for [Requant] with a more descriptive name that pairs naturally with [Dequant].
+// Supported types: F32, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K (S and L variants), Q4_K, Q5_K, Q6_K, NVFP4.
+// Returns an error if the target type is unsupported or the data length does not match a block boundary.
 func Requantize(data []float32, targetType GgmlType) ([]byte, error) {
 	switch targetType {
 	case GgmlF32:

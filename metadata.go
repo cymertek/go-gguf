@@ -2,7 +2,13 @@ package gguf
 
 import "fmt"
 
-// CopyMetadataLazy copies KV entries from a lazy GGUF reader to a writer.
+// CopyMetadataLazy copies metadata (KV pairs) from a lazy [*GGUF] reader to a [GGUFWriter], applying
+// optional glob-style filters via Include and Exclude patterns. Entries that fail to load are silently
+// skipped. Use this when you need to transfer model configuration without copying tensor data.
+//
+// Example -- copy only architecture-related metadata:
+//
+//	err := gguf.CopyMetadataLazy(dst, src, []string{"general.*"}, nil)
 func CopyMetadataLazy(dst *GGUFWriter, src *GGUF, include, exclude []string) error {
 	metaEntries, err := src.Metadata()
 	if err != nil {
@@ -47,7 +53,13 @@ func CopyMetadataLazy(dst *GGUFWriter, src *GGUF, include, exclude []string) err
 	return nil
 }
 
-// FilterMetadataEntries returns a subset of KVEntry slice matching the given pattern.
+// FilterMetadataEntries returns a new slice containing only [KVEntry] items whose Key matches the
+// given glob-style pattern (via [MatchPattern]). The original entries slice is not modified.
+// Returns nil if no entries match.
+//
+// Example -- keep only general.* keys:
+//
+//	keep := gguf.FilterMetadataEntries(allMeta, "general.*")
 func FilterMetadataEntries(entries []KVEntry, pattern string) []KVEntry {
 	var keep []KVEntry
 	for _, kv := range entries {
@@ -58,8 +70,9 @@ func FilterMetadataEntries(entries []KVEntry, pattern string) []KVEntry {
 	return keep
 }
 
-// MergeMetadataEntries merges KV entries from src into dst.
-// If dst already has a key, it is overwritten by src's value.
+// MergeMetadataEntries copies all [KVEntry] pairs from src into the writer dst via [GGUFWriter.SetKV].
+// If dst already contains a key with the same name, its value is overwritten by src's. Call before
+// [GGUFWriter.Close]; the entries are not validated beyond being set on the writer.
 func MergeMetadataEntries(dst *GGUFWriter, src []KVEntry) {
 	for _, e := range src {
 		dst.SetKV(e.Key, e.Value)

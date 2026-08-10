@@ -39,7 +39,12 @@ var ErrCorrupt = errors.New("gguf: corrupt file")
 // BType — GGUF metadata value type (wire format enum)
 // ---------------------------------------------------------------------------
 
-// BType represents a GGUF metadata value type.
+// BType represents a GGUF metadata value type on the wire format.
+// It identifies how a single key-value pair's value is encoded in the file.
+//
+// Valid values: BTypeUint8, BTypeInt8, BTypeUint16, BTypeInt16, BTypeUint32,
+// BTypeInt32, BTypeFloat32, BTypeBool, BTypeString, BTypeArray, BTypeUint64,
+// BTypeInt64, BTypeFloat64.
 type BType uint32
 
 const (
@@ -59,6 +64,8 @@ const (
 )
 
 // Size returns the wire size in bytes of a single scalar value for this type.
+// For example, BTypeFloat32.Size() == 4, BTypeBool.Size() == 1.
+// Returns 0 for unsupported or array types (BTypeString/BTypeArray have variable sizes).
 func (t BType) Size() int {
 	switch t {
 	case BTypeUint8, BTypeInt8, BTypeBool:
@@ -78,7 +85,9 @@ func (t BType) Size() int {
 // GgmlType — tensor data quantization / layout type
 // ---------------------------------------------------------------------------
 
-// GgmlType represents a GGML tensor type (quantization scheme or raw float format).
+// GgmlType represents a GGML tensor type, i.e. the quantization scheme or raw floating-point
+// format used to encode a tensor's data on disk. Each value selects a specific block layout;
+// see [GgmlType.BlockBytes] and [GgmlType.ElementsPerBlock].
 type GgmlType uint32
 
 const (
@@ -114,7 +123,8 @@ const (
 	GgmlNVFP4 GgmlType = 40 // NVIDIA NVFP4: 64-element block (4x16 sub-blocks), UE4M3 sub-scales
 )
 
-// GgmlName returns the human-readable name for this quantization type.
+// GgmlName returns a short, human-readable name for this quantization type
+// (e.g., "Q4_0", "F32", "NVFP4"). Useful for logging and display.
 func (t GgmlType) GgmlName() string {
 	switch t {
 	case GgmlF32:
@@ -173,6 +183,8 @@ func (t GgmlType) GgmlName() string {
 }
 
 // ElementsPerBlock returns the number of tensor elements represented by one quantization block.
+// For raw float types (F32, F16) this is 1. For quantized types it varies: Q4_0/Q5_0/Q8_0 use 32,
+// K-quantizations (Q2_K..Q6_K) use 256, NVFP4 uses 64. Returns 0 for unsupported types.
 func (t GgmlType) ElementsPerBlock() int {
 	switch t {
 	case GgmlF32, GgmlF16:
@@ -188,7 +200,9 @@ func (t GgmlType) ElementsPerBlock() int {
 	}
 }
 
-// BlockBytes returns the number of bytes consumed by one quantization block.
+// BlockBytes returns the number of bytes consumed by one quantization block on disk.
+// For F32 this is 4, for Q8_0 it is 34 (2-byte scale + 32 signed bytes), etc.
+// Returns 0 if the type has no standard block layout (e.g., deprecated or unknown types).
 func (t GgmlType) BlockBytes() int {
 	switch t {
 	case GgmlF32:
@@ -220,7 +234,9 @@ func (t GgmlType) BlockBytes() int {
 	}
 }
 
-// IsSupported returns true if this type is supported for reading and dequantization.
+// IsSupported returns true if this type has a known block layout and is supported
+// for reading and dequantization by [Dequant]. A return value of false means the
+// type constant exists but no decoder is implemented yet.
 func (t GgmlType) IsSupported() bool {
 	return t.BlockBytes() != 0
 }
@@ -229,17 +245,22 @@ func (t GgmlType) IsSupported() bool {
 // Value — parsed GGUF metadata value
 // ---------------------------------------------------------------------------
 
-// Value holds a single metadata value that has been parsed from wire format.
+// Value holds a single metadata value that has been parsed from the GGUF wire format.
+// Use one of the typed accessor methods (AsBool, AsInt, AsUint64, AsFloat, AsString) to
+// extract the actual Go value. Each accessor returns a second bool indicating whether the
+// conversion succeeded for this BType.
 type Value struct {
-	BType    BType   // type tag
-	Int      int64   // integer or bool (true for bool)
-	Float    float64 // floating-point value
-	Str      string  // string value
-	ElemType BType   // element type for arrays
-	Raw      []byte  // raw wire bytes for arrays / strings
+	BType    BType   // type tag identifying which field is valid
+	Int      int64   // integer or bool (true for bool) -- valid for all numeric types
+	Float    float64 // floating-point value -- valid when BType is BTypeFloat32 or BTypeFloat64
+	Str      string  // string value -- valid when BType is BTypeString
+	ElemType BType   // element type for arrays -- valid when BType is BTypeArray
+	Raw      []byte  // raw wire bytes for arrays / strings -- valid when BType is BTypeArray or BTypeString
 }
 
-// AsBool returns the value if it is a bool.
+// AsBool returns the value as bool and true if the stored BType is BTypeBool,
+// otherwise returns false in the second return value. Safe to call on any Value;
+// only bool-typed values will succeed.
 func (v Value) AsBool() (bool, bool) {
 	if v.BType != BTypeBool {
 		return false, false
@@ -247,7 +268,9 @@ func (v Value) AsBool() (bool, bool) {
 	return v.Int != 0, true
 }
 
-// AsInt returns the value if it is an integer type.
+// AsInt returns the value as int64 and true if the stored BType is one of the
+// signed or unsigned integer types (BTypeUint8 through BTypeInt64). Returns zero
+// and false for float, string, bool, or array values.
 func (v Value) AsInt() (int64, bool) {
 	switch v.BType {
 	case BTypeInt8, BTypeInt16, BTypeInt32, BTypeInt64,
@@ -258,7 +281,9 @@ func (v Value) AsInt() (int64, bool) {
 	}
 }
 
-// AsUint64 returns the value if it is an unsigned integer type.
+// AsUint64 returns the value as uint64 and true if the stored BType is one of the
+// unsigned integer types (BTypeUint8, BTypeUint16, BTypeUint32, BTypeUint64).
+// Signed integer types are rejected. Returns zero and false otherwise.
 func (v Value) AsUint64() (uint64, bool) {
 	switch v.BType {
 	case BTypeUint8, BTypeUint16, BTypeUint32, BTypeUint64:
@@ -268,7 +293,9 @@ func (v Value) AsUint64() (uint64, bool) {
 	}
 }
 
-// AsFloat returns the value if it is a float type.
+// AsFloat returns the value as float64 and true if the stored BType is one of the
+// floating-point types (BTypeFloat32 or BTypeFloat64). Returns zero and false for
+// integer, string, bool, or array values. Float32 values are converted to float64.
 func (v Value) AsFloat() (float64, bool) {
 	switch v.BType {
 	case BTypeFloat32, BTypeFloat64:
@@ -278,7 +305,8 @@ func (v Value) AsFloat() (float64, bool) {
 	}
 }
 
-// AsString returns the value if it is a string type.
+// AsString returns the value as string and true if the stored BType is BTypeString.
+// Returns empty string and false for all other types.
 func (v Value) AsString() (string, bool) {
 	if v.BType == BTypeString {
 		return v.Str, true
@@ -291,6 +319,11 @@ func (v Value) AsString() (string, bool) {
 // ---------------------------------------------------------------------------
 
 // TensorInfo holds the parsed metadata for a single tensor in a GGUF file.
+// It describes the tensor's name, shape (dimensions), quantization type, offset within
+// the tensor-data section, and total byte size. The Offset field is relative to dataStart
+// (the aligned start of the tensor-data section) and is NOT necessarily 32-byte aligned --
+// alignment padding occurs between tensors. NBytes can be zero for unsupported GgmlType values;
+// in that case [Tensor.Bytes] will derive it from consecutive offsets.
 type TensorInfo struct {
 	Name     string    // tensor name (UTF-8)
 	Shape    []uint64  // dimension sizes
@@ -304,7 +337,12 @@ type TensorInfo struct {
 // ---------------------------------------------------------------------------
 
 // GGUF is the primary lazy reader for GGUF files. It accepts any io.ReaderAt at open time,
-// reads only the 24-byte header, and walks KV metadata + tensor info on-demand via Seek/ReadAt calls.
+// reads only the 24-byte header immediately, and walks KV metadata + tensor info on-demand
+// via [GGUF.Metadata], [GGUF.Tensors] calls. The returned *GGUF must be closed with [GGUF.Close]
+// when no longer needed to release the underlying file handle (if it is an io.Closer).
+//
+// GGUF is safe for concurrent reads of different tensors or metadata entries, but each method
+// call (Metadata, Tensors) takes a mutex and must not be called concurrently with itself.
 type GGUF struct {
 	r       io.ReaderAt     // any ReaderAt: *os.File, S3 range reader, gzip decompressor, etc.
 	fileSz  int64           // total file size (provided by caller at Open time)
@@ -642,19 +680,25 @@ func (g *GGUF) detectSplit(sourcePath string) (*splitInfo, error) {
 	// Second pass: validate all shards belong together
 	refShard := shardMetas[0] // Use first shard as reference
 
+	fmt.Printf("DEBUG: refShard.splitNo=%d, refShard.splitCount=%d\n", refShard.splitNo, refShard.splitCount)
+
 	for i, meta := range shardMetas {
+		fmt.Printf("DEBUG: shard %d - splitNo=%d, splitCount=%d, arch=%q\n", i+1, meta.splitNo, meta.splitCount, meta.arch)
+
+		// Validate split.no is within expected range (using refShard's count)
 		if meta.splitNo < 0 || meta.splitNo >= refShard.splitCount {
 			return nil, fmt.Errorf("gguf: shard %d has invalid split.no=%d (expected 0 to %d)",
 				i+1, meta.splitNo, refShard.splitCount-1)
 		}
 
-		if meta.splitCount != refShard.splitCount {
+		// Validate split.count matches if present in both shards
+		if meta.splitCount != 0 && meta.splitCount != refShard.splitCount {
 			return nil, fmt.Errorf("gguf: shard %d has split.count=%d, but shard 0 has split.count=%d (shards don't match)",
 				i+1, meta.splitCount, refShard.splitCount)
 		}
 
-		// Only validate architecture if both shards have it set
-		if refShard.arch != "" && meta.arch != "" && meta.arch != refShard.arch {
+		// Validate architecture matches if present in both shards
+		if meta.arch != "" && refShard.arch != "" && meta.arch != refShard.arch {
 			return nil, fmt.Errorf("gguf: shard %d has architecture %q, but shard 0 has architecture %q (shards don't match)",
 				i+1, meta.arch, refShard.arch)
 		}
@@ -789,8 +833,9 @@ type kvEntry struct {
 // Tensor — file-backed tensor handle with per-tensor partial-read cache
 // ---------------------------------------------------------------------------
 
-// Tensor is a file-backed tensor handle. It wraps TensorInfo metadata and provides
-// a read cache that avoids disk seeks for repeated reads of the same region.
+// Tensor is a file-backed tensor handle. It wraps [TensorInfo] metadata and provides
+// an internal 1 MB read cache to avoid redundant disk seeks when reading overlapping regions.
+// A *Tensor should be closed with [Tensor.Close] when no longer needed to release the cached buffer.
 type Tensor struct {
 	info      TensorInfo  // embedded: Name, Shape, GgmlType, Offset, NBytes
 	absOffset uint64      // absolute file offset of aligned tensor data start
@@ -803,8 +848,18 @@ type Tensor struct {
 	cacheValid bool          // true if cache contains valid data
 }
 
-// Info returns a copy of this tensor's metadata.
-func (t *Tensor) Info() TensorInfo { return t.info }
+// Info returns a copy of this tensor's metadata. The returned [TensorInfo]
+// contains deep-copied slices so modifications to the return value won't affect
+// the original tensor's data. Callers should use [Tensor.Bytes], [Tensor.ReadAt],
+// or [Tensor.Dequant] for actual data access; Info() is read-only introspection.
+func (t *Tensor) Info() TensorInfo {
+	info := t.info
+	if info.Shape != nil {
+		info.Shape = make([]uint64, len(info.Shape))
+		copy(info.Shape, t.info.Shape)
+	}
+	return info
+}
 
 // Close releases the per-tensor read cache buffer back to the pool.
 func (t *Tensor) Close() {
@@ -836,16 +891,21 @@ type MetadataEntry struct {
 	ok     bool        // true if val has been loaded and cached
 }
 
-// Name returns the entry's key name.
+// Name returns the entry's key name as stored in the GGUF file.
 func (e *MetadataEntry) Name() string { return e.key }
 
-// BType returns the GGUF value type identifier.
+// BType returns the GGUF value type identifier for this metadata entry,
+// indicating how [Value] or one of the typed accessors should be used to read it.
 func (e *MetadataEntry) BType() BType { return e.btype }
 
-// Size returns the total wire size of the value data in bytes.
+// Size returns the total wire size of the value data in bytes, excluding the key_len,
+// key, and btype fields from the GGUF wire format. Useful for pre-allocating buffers.
 func (e *MetadataEntry) Size() int64 { return e.wireSz }
 
-// Value loads and parses the raw KV data from file at stored offset, caching it on first call.
+// Value loads and parses the raw KV data from file at the stored offset, caching the
+// result so subsequent calls return immediately without disk I/O. For string and array
+// values this may involve a seek; for small scalar values (<=64 bytes) the value is
+// already eagerly loaded during [GGUF.Metadata] and returns instantly.
 func (e *MetadataEntry) Value() (Value, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -875,7 +935,8 @@ func (e *MetadataEntry) SetValue(v any) error {
 	return nil
 }
 
-// AsString returns the parsed string value.
+// AsString returns the parsed string value, or an error if the entry's BType is not
+// BTypeString. Convenience wrapper around [Value].AsString().
 func (e *MetadataEntry) AsString() (string, error) {
 	v, err := e.Value()
 	if err != nil {
@@ -887,7 +948,8 @@ func (e *MetadataEntry) AsString() (string, error) {
 	return "", fmt.Errorf("gguf: key %q is not a string (got btype %d)", e.key, e.btype)
 }
 
-// AsInt64 returns the parsed integer value.
+// AsInt64 returns the parsed integer value as int64, or an error if the entry's BType is not
+// a supported integer type. Convenience wrapper around [Value].AsInt().
 func (e *MetadataEntry) AsInt64() (int64, error) {
 	v, err := e.Value()
 	if err != nil {
@@ -900,7 +962,8 @@ func (e *MetadataEntry) AsInt64() (int64, error) {
 	return i, nil
 }
 
-// AsFloat64 returns the parsed float value.
+// AsFloat64 returns the parsed float value as float64, or an error if the entry's BType is not
+// a supported floating-point type. Convenience wrapper around [Value].AsFloat().
 func (e *MetadataEntry) AsFloat64() (float64, error) {
 	v, err := e.Value()
 	if err != nil {
@@ -918,9 +981,10 @@ func (e *MetadataEntry) AsFloat64() (float64, error) {
 // ---------------------------------------------------------------------------
 
 // KVEntry holds a single key-value pair ready to be written into a GGUF file.
+// Use [StreamWriter.SetMetadataEntry] or [GGUFWriter.SetKV] with this type.
 type KVEntry struct {
-	Key   string
-	Value Value
+	Key   string // metadata key name (UTF-8)
+	Value Value  // parsed value; set BType and the appropriate field (Int, Float, Str, Raw)
 }
 
 // ---------------------------------------------------------------------------
@@ -971,7 +1035,9 @@ func putBuffer(buf []byte) {
 // Multi-shard GGUF support — public API methods
 // ---------------------------------------------------------------------------
 
-// ShardIndex returns the index of this GGUF in a split file (0-based).
+// ShardIndex returns the 0-based index of this GGUF reader within its multi-shard split,
+// or -1 if this is not part of a split (single-file GGUF). Useful for displaying progress
+// when iterating over shards in order.
 func (g *GGUF) ShardIndex() int {
 	if g.splitInfo == nil || len(g.splitInfo.shards) == 0 {
 		return -1
@@ -984,12 +1050,15 @@ func (g *GGUF) ShardIndex() int {
 	return -1
 }
 
-// IsSplit returns true if this GGUF is part of a multi-shard file.
+// IsSplit returns true when the underlying file is one shard of a multi-file split GGUF
+// (e.g., DeepSeek-V4). When true, [SplitInfo] will be non-nil and contains per-shard metadata.
 func (g *GGUF) IsSplit() bool {
 	return g.splitInfo != nil && len(g.splitInfo.shards) > 1
 }
 
-// SplitInfo returns information about the split shards, or nil if not a split file.
+// SplitInfo returns metadata about all shards in a multi-shard GGUF split, or nil if this
+// is a single-file GGUF. The returned [SplitInfo] contains per-shard handles ([SplitShard])
+// that can each be used to read their own metadata and tensors independently.
 func (g *GGUF) SplitInfo() *SplitInfo {
 	if g.splitInfo == nil {
 		return nil
@@ -1022,14 +1091,18 @@ func (g *GGUF) SplitInfo() *SplitInfo {
 	return info
 }
 
-// SplitInfo contains metadata about a multi-shard GGUF file.
+// SplitInfo contains metadata about a multi-shard GGUF file (e.g., DeepSeek-V4).
+// It reports the total number of shards, per-shard tensor counts from headers, and provides
+// [SplitShard] handles for reading each shard's metadata and tensors independently.
 type SplitInfo struct {
-	Count           int          // total number of shards
+	Count           int           // total number of shards
 	TensorsPerShard []uint64     // tensor count per shard (from headers)
 	Shards          []*SplitShard // actual shard handles with readers
 }
 
-// SplitShard represents a single shard in a multi-shard GGUF file.
+// SplitShard represents a single shard in a multi-shard GGUF file. It carries file-level
+// metadata (path, size, version, tensor/KV counts) and provides access to the shard's own
+// [MetadataEntry] list and [*Tensor] handles via its GetMetadata and Tensors methods.
 type SplitShard struct {
 	Index      int       // 0-based index in the split
 	Path       string    // original path to this shard
@@ -1040,7 +1113,9 @@ type SplitShard struct {
 	reader     *GGUF     // parent GGUF reader for this shard (nil for non-primary shards)
 }
 
-// GetMetadata returns the metadata entries for this shard.
+// GetMetadata returns the parsed [MetadataEntry] list for this shard by delegating to
+// the underlying [*GGUF]. The returned slice is safe to read concurrently with other
+// shards but must not be modified. Returns an error if the shard has no reader attached.
 func (s *SplitShard) GetMetadata() ([]*MetadataEntry, error) {
 	if s.reader == nil {
 		return nil, fmt.Errorf("split shard %d has no reader", s.Index)
@@ -1048,7 +1123,9 @@ func (s *SplitShard) GetMetadata() ([]*MetadataEntry, error) {
 	return s.reader.Metadata()
 }
 
-// Tensors returns the tensor handles for this shard.
+// Tensors returns the [*Tensor] handles for this shard by delegating to the underlying
+// [*GGUF]. Each handle provides lazy [Tensor.ReadAt], [Tensor.Bytes], and [Tensor.Dequant]
+// access. Returns an error if the shard has no reader attached.
 func (s *SplitShard) Tensors() ([]*Tensor, error) {
 	if s.reader == nil {
 		return nil, fmt.Errorf("split shard %d has no reader", s.Index)
@@ -1056,6 +1133,8 @@ func (s *SplitShard) Tensors() ([]*Tensor, error) {
 	return s.reader.Tensors()
 }
 
-// ShardIndex returns the index of this GGUF in a split file (0-based).
+// ShardIndex reports the shard index for a [SplitInfo]. This method always returns -1 because
+// [SplitInfo] describes a collection of shards, not an individual one. Use [SplitShard.Index]
+// instead to get a specific shard's position in the split.
 func (s *SplitInfo) ShardIndex() int { return -1 } // Not applicable to SplitInfo itself
 

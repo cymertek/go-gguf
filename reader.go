@@ -5,8 +5,9 @@ import (
 	"os"
 )
 
-// NewReader opens a GGUF file by path and returns a lazy reader.
-// This is the recommended entry point for most use cases.
+// NewReader opens a GGUF file by [path] and returns a lazy [*GGUF] reader. It is functionally equivalent
+// to [Open]; the name exists for backwards compatibility with earlier API versions that used a Reader type.
+// The returned *GGUF must be closed via [GGUF.Close] when no longer needed.
 func NewReader(path string) (*GGUF, error) {
 	f, err := os.Open(path)
 	if err != nil {

@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	gguf "github.com/cymertek/go-gguf/gguf"
+	gguf "github.com/cymertek/go-gguf"
 )
 
 func main() {

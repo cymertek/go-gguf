@@ -14,8 +14,20 @@ const defaultAlignment = uint64(32)
 // Open — reads only the 24-byte header, returns a lazy GGUF handle
 // ---------------------------------------------------------------------------
 
-// Open opens a GGUF file by path. If the file is part of a split, it will automatically
-// detect and combine all shards into a single logical reader.
+// Open opens a GGUF file by path and returns a lazy [*GGUF] reader. If the file is part of
+// a multi-shard split (e.g., DeepSeek-V4 with files named "model-*-of-NNNNN.gguf"), it will
+// automatically detect all shards, validate header consistency across them, and combine into
+// a single logical [io.ReaderAt]. The returned *GGUF must be closed via [GGUF.Close] when done.
+//
+// Open reads only the 24-byte GGUF header immediately; KV metadata and tensor info are walked
+// lazily on first call to [GGUF.Metadata] or [GGUF.Tensors].
+//
+// Example:
+//
+//	g, err := gguf.Open("model.gguf")
+//	if err != nil { log.Fatal(err) }
+//	defer g.Close()
+//	fmt.Printf("Version=%d Tensors=%d KV=%d\n", g.Version(), g.NumTensors(), len(g.Metadata()))
 func Open(path string) (*GGUF, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -48,7 +60,17 @@ func Open(path string) (*GGUF, error) {
 	return g, nil
 }
 
-// OpenFromReader opens a GGUF from an io.ReaderAt. Used for testing and custom readers.
+// OpenFromReader opens a GGUF file from any [io.ReaderAt] (e.g., *os.File, S3 range reader,
+// gzip decompressor) and returns a lazy [*GGUF]. The caller must provide the exact total file
+// size via fileSz. This is useful for testing with in-memory buffers or for reading over
+// network protocols that implement ReaderAt semantics.
+//
+// Example:
+//
+//	data := readFile("model.gguf")
+//	g, err := gguf.OpenFromReader(bytes.NewReader(data), int64(len(data)))
+//	if err != nil { log.Fatal(err) }
+//	defer g.Close()
 func OpenFromReader(r io.ReaderAt, fileSz int64) (*GGUF, error) {
 	if fileSz < 24 {
 		return nil, fmt.Errorf("gguf: file size %d too small for header", fileSz)
@@ -84,8 +106,10 @@ func OpenFromReader(r io.ReaderAt, fileSz int64) (*GGUF, error) {
 	return g, nil
 }
 
-// Close releases the GGUF reader. For io.Closer implementations (like *os.File),
-// this closes the underlying handle. Otherwise it is a no-op.
+// Close releases the GGUF reader. If the underlying [io.ReaderAt] also implements io.Closer
+// (e.g., [*os.File]), this closes the file handle. For in-memory readers or other non-closable
+// types, it is a no-op and returns nil. Always call Close when done reading to avoid leaking
+// file descriptors.
 func (g *GGUF) Close() error {
 	if c, ok := g.r.(io.Closer); ok {
 		return c.Close()
@@ -93,14 +117,19 @@ func (g *GGUF) Close() error {
 	return nil
 }
 
-// Version returns the GGUF file version.
+// Version returns the GGUF file version read from the 24-byte header. Valid values are
+// [Version1], [Version2], or [Version3]. The library currently only fully supports v3 files;
+// older versions will return an error at open time.
 func (g *GGUF) Version() uint32 { return g.version }
 
-// NumTensors returns the number of tensors from the header.
+// NumTensors returns the number of tensors reported in the GGUF header. This is a fast,
+// zero-allocation query that does not walk the tensor metadata section -- actual [Tensor]
+// handles are only constructed when [GGUF.Tensors] or related methods are called.
 func (g *GGUF) NumTensors() int { return int(g.nTensor) }
 
-// OpenForRead opens a GGUF file by path for lazy reading.
-// This is a convenience wrapper around Open that handles os.Open and Stat internally.
+// OpenForRead opens a GGUF file by path for lazy reading. It is an alias for [Open] with the
+// same semantics -- reads only the 24-byte header immediately and walks KV/tensor sections lazily.
+// Prefer [Open] for new code; this name exists for backwards compatibility.
 func OpenForRead(path string) (*GGUF, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -127,8 +156,11 @@ func OpenForRead(path string) (*GGUF, error) {
 
 const eagerThreshold = 64 // only eagerly parse values ≤64 bytes during KV walk
 
-// Metadata walks the KV section and returns all entries. Small values (≤64B, non-string/array)
-// are parsed immediately; large string/array values remain file-backed with lazy loading on Value().
+// Metadata walks the KV section and returns all [MetadataEntry] handles. Small scalar values
+// (≤64 bytes wire size, non-string/array) are parsed eagerly during this walk; large string
+// or array values remain file-backed and are only loaded on first call to [MetadataEntry.Value].
+// The returned slice is safe for concurrent reads but must not be modified. Subsequent calls
+// return the cached result without re-walking the section.
 func (g *GGUF) Metadata() ([]*MetadataEntry, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -382,8 +414,19 @@ func readLazyValue(r io.ReaderAt, off int64, btype BType, wireSz int64) (Value, 
 // walkTensorSection — sequential tensor metadata walk (ONE seek from kvEnd)
 // ---------------------------------------------------------------------------
 
-// Tensors walks the tensor metadata section and returns all tensors.
-// This performs exactly ONE seek to kvEnd + N sequential reads for nTensor entries.
+// Tensors walks the tensor metadata section and returns all [*Tensor] handles.
+// It performs exactly ONE seek followed by N sequential reads for nTensor entries, making it
+// efficient for large models with thousands of tensors. The returned slice is safe for concurrent
+// reads but must not be modified. Subsequent calls return cached results without re-walking.
+//
+// Example:
+//
+//	tensors, err := g.Tensors()
+//	if err != nil { log.Fatal(err) }
+//	for _, t := range tensors[:3] { // inspect first 3 tensors
+//	    info := t.Info()
+//	    fmt.Printf("%s shape=%v type=%s\n", info.Name, info.Shape, info.GgmlType.GgmlName())
+//	}
 func (g *GGUF) Tensors() ([]*Tensor, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -506,6 +549,9 @@ func (g *GGUF) walkTensorSection() error {
 		var nBytes uint64
 		if elsPerBlock != 0 && blockBytes != 0 {
 			nBytes = totalElements * uint64(blockBytes) / uint64(elsPerBlock)
+		} else if elsPerBlock == 0 && blockBytes == 0 {
+			// For unknown types, set NBytes to 0 (will be calculated later from offsets)
+			nBytes = 0
 		}
 
 		g.tensorInfos = append(g.tensorInfos, TensorInfo{
@@ -515,6 +561,25 @@ func (g *GGUF) walkTensorSection() error {
 			Offset:   tensorOff,
 			NBytes:   nBytes,
 		})
+	}
+
+	// After all tensors are processed, calculate NBytes for unknown types
+	// by looking at consecutive tensor offsets
+	for i := 0; i < len(g.tensorInfos); i++ {
+		if g.tensorInfos[i].NBytes == 0 && g.tensorInfos[i].Offset != 0 {
+			// Calculate NBytes from next tensor's offset (or end of file for last tensor)
+			var nextOffset uint64
+			if i+1 < len(g.tensorInfos) {
+				nextOffset = g.tensorInfos[i+1].Offset
+			} else {
+				// Last tensor - use dataStart as approximate end
+				nextOffset = g.dataStart
+			}
+
+			if nextOffset > g.tensorInfos[i].Offset {
+				g.tensorInfos[i].NBytes = nextOffset - g.tensorInfos[i].Offset
+			}
+		}
 	}
 
 	g.dataStart = uint64(pos) // unaligned end of tensor metadata section
@@ -532,9 +597,11 @@ func (g *GGUF) walkTensorSection() error {
 
 const tensorCacheMinSize = int64(1 << 20) // minimum cache size: 1MB (alignment-aligned block)
 
-// ReadAt reads up to len(dst) bytes starting at off (relative to tensor data start).
-// On the first call, reads a larger chunk into the per-tensor cache. Subsequent calls
-// within the cached region serve from memory without disk I/O.
+// ReadAt reads up to len(dst) bytes starting at off (relative to tensor data start) into dst.
+// On the first call it reads a 1 MB aligned chunk into an internal cache; subsequent calls
+// within that cached region serve from memory without disk I/O, significantly speeding up
+// repeated partial reads of the same tensor. Off is relative to the tensor's aligned data
+// start (not file offset). Returns io.EOF when off is past the end of the tensor.
 func (t *Tensor) ReadAt(dst []byte, off int64) (int, error) {
 	if len(dst) == 0 {
 		return 0, nil
@@ -617,17 +684,27 @@ func readFull(r io.ReaderAt, buf []byte, off int64) (int, error) {
 // Dequant convenience method on Tensor
 // ---------------------------------------------------------------------------
 
-// Bytes reads the entire tensor data into a newly allocated slice.
+// Bytes reads the entire tensor data into a newly allocated byte slice and returns it.
+// Use [Tensor.ReadAt] for partial or streaming reads instead; this method is convenient
+// for small tensors but allocates memory proportional to the full tensor size.
 func (t *Tensor) Bytes() ([]byte, error) {
 	buf := make([]byte, t.info.NBytes)
+
 	n, err := readFull(t.gguf.r, buf, int64(t.absOffset))
-	if err != nil || n == 0 {
+	if err != nil {
 		return nil, fmt.Errorf("gguf: read tensor %s data: %w", t.info.Name, err)
 	}
+	if n == 0 {
+		return nil, fmt.Errorf("gguf: read tensor %s data: no bytes read", t.info.Name)
+	}
+
 	return buf[:n], nil
 }
 
-// Dequant reads the raw tensor bytes and dequantizes them to float32 values.
+// Dequant reads the entire raw tensor data from file, then calls [Dequant] to convert it
+// into a []float32 slice of de-quantized values. For large tensors this allocates memory for
+// both the raw bytes and the float slice; prefer [Tensor.Data] + streaming dequantization
+// for memory-constrained applications. The returned slice must not be modified by the caller.
 func (t *Tensor) Dequant() ([]float32, error) {
 	data, err := t.Bytes()
 	if err != nil {
@@ -636,7 +713,10 @@ func (t *Tensor) Dequant() ([]float32, error) {
 	return Dequant(data, t.info.GgmlType)
 }
 
-// Data returns an io.ReaderAt positioned at this tensor's raw data in the file.
+// Data returns an [io.ReaderAt] that reads from this tensor's raw data region in the underlying
+// file. The returned reader is positioned at the aligned start of the tensor data and has a
+// fixed length equal to NBytes. Useful for passing tensor bytes directly to other libraries
+// (e.g., neural network inference backends) without copying into memory first.
 func (t *Tensor) Data() (io.ReaderAt, error) {
 	return &tensorReaderAt{
 		r:  t.gguf.r,

@@ -13,7 +13,10 @@ import (
 // StreamWriter — low-memory backend that writes directly to io.WriterAt
 // ---------------------------------------------------------------------------
 
-// StreamWriter writes GGUF files directly to an io.WriterAt, avoiding full in-memory accumulation.
+// StreamWriter writes GGUF files directly to an [io.WriterAt], avoiding full in-memory
+// accumulation of the entire file. It is the low-level backend used by [GGUFWriter] and
+// [Create]. Metadata (KV pairs) are kept in memory since they are small; tensor data is
+// written sequentially at [StreamWriter.Close] time after all tensors have been queued.
 type StreamWriter struct {
 	w        io.WriterAt     // underlying writer (file, network buffer, etc.)
 	meta     *writerMeta     // accumulated KV entries (in memory — always small)
@@ -50,7 +53,10 @@ type tensorBuf struct {
 // Create — high-level builder for writing GGUF files to any io.Writer
 // ---------------------------------------------------------------------------
 
-// Create creates a new GGUF file writer wrapping the given io.Writer.
+// Create creates a new [GGUFWriter] wrapping the given [io.Writer]. If w implements [io.WriterAt],
+// data is written directly to it; otherwise it is wrapped in an adapter that buffers writes.
+// Use [GGUFWriter.SetKV] to add metadata, [GGUFWriter.AddTensor] + [GGUFWriter.WriteTensorData]
+// to queue and stream tensor data, then [GGUFWriter.Close] to flush the header and finalize.
 func Create(w io.Writer) *GGUFWriter {
 	var sw *StreamWriter
 	if wa, ok := w.(io.WriterAt); ok {
@@ -61,7 +67,9 @@ func Create(w io.Writer) *GGUFWriter {
 	return &GGUFWriter{sw: sw, meta: sw.meta}
 }
 
-// OpenForWrite creates a GGUF writer for the given file path.
+// OpenForWrite creates a [GGUFWriter] that writes to a new file at the given path. The file is
+// created with [os.Create] (truncating any existing content). Equivalent to Create(os.File) but
+// manages the file handle internally until Close. Returns an error if the file cannot be opened.
 func OpenForWrite(path string) (*GGUFWriter, error) {
 	f, err := os.Create(path)
 	if err != nil {
@@ -71,7 +79,10 @@ func OpenForWrite(path string) (*GGUFWriter, error) {
 	return w, nil
 }
 
-// ConvertName translates tensor names from llama.cpp convention to HuggingFace convention.
+// ConvertName translates tensor names from the llama.cpp naming convention to the Hugging Face
+// Transformers convention (and vice versa for symmetric keys). Handles special cases like
+// "output.weight" -> "lm_head.weight", and replaces prefix patterns like "blk." -> "model.layers.".
+// Returns the original name unchanged if no conversion applies.
 func ConvertName(name string) string {
 	conv := map[string]string{
 		"output.weight":      "lm_head.weight",
@@ -120,41 +131,57 @@ func (a *writerAdapter) WriteAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// GGUFWriter is a high-level builder for creating new GGUF files.
+// GGUFWriter is a high-level builder for creating new GGUF files. It wraps [StreamWriter] and
+// provides a simple API: call [GGUFWriter.SetKV] to add metadata, [GGUFWriter.AddTensor] +
+// [GGUFWriter.WriteTensorData] to queue tensors with their data, then [GGUFWriter.Close] to
+// finalize the file. GGUFWriter is NOT safe for concurrent use; serialize calls from a single goroutine.
 type GGUFWriter struct {
 	sw    *StreamWriter
 	meta  *writerMeta // alias to StreamWriter's internal meta
 }
 
-// SetKV adds or replaces a key-value pair in the metadata section.
+// SetKV adds or replaces a key-value pair in the metadata section. If the key already exists,
+// its value is overwritten. Call before [GGUFWriter.AddTensor] or [GGUFWriter.Close].
 func (w *GGUFWriter) SetKV(key string, v Value) error {
 	return w.sw.SetMetadataEntry(KVEntry{Key: key, Value: v})
 }
 
-// GetMetadata returns copies of all KV entries currently queued for writing.
+// GetMetadata returns deep copies of all [KVEntry] pairs currently queued for writing. The returned
+// slice is safe to read and modify without affecting the writer's state. Useful for inspecting
+// or transforming metadata before finalizing with [GGUFWriter.Close].
 func (w *GGUFWriter) GetMetadata() []KVEntry {
 	result := make([]KVEntry, len(w.meta.pairs))
 	copy(result, w.meta.pairs)
 	return result
 }
 
-// AddTensor queues a tensor to be written later. Returns the index for WriteTensorData.
+// AddTensor queues a tensor definition (name, shape, quantization type) to be written later.
+// Returns an index that must be passed to [GGUFWriter.WriteTensorData] to stream the raw bytes.
+// Call in any order; data is written sequentially at [GGUFWriter.Close]. The shape slice is copied
+// internally so the caller may reuse it after this call returns.
 func (w *GGUFWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType) uint64 {
 	idx := w.sw.AddTensor(name, shape, ggmlType)
 	return idx
 }
 
-// NumTensors returns the number of queued tensors.
+// NumTensors returns the number of tensors currently queued for writing via [GGUFWriter.AddTensor].
+// Useful for tracking progress during large model writes.
 func (w *GGUFWriter) NumTensors() int {
 	return len(w.sw.tensors)
 }
 
-// WriteTensorData streams the raw tensor data for a previously queued tensor.
+// WriteTensorData reads all bytes from r and associates them with the tensor at index idx
+// (returned by [GGUFWriter.AddTensor]). The data must match exactly the size predicted by
+// the tensor's shape and GgmlType; a short or long read returns an error. Call in the same
+// order as AddTensor indices.
 func (w *GGUFWriter) WriteTensorData(idx uint64, r io.Reader) error {
 	return w.sw.WriteTensorData(idx, r)
 }
 
-// Close flushes header + KV section + tensor metadata and closes the underlying writer.
+// Close writes the GGUF header, KV section, tensor metadata section, alignment padding, and all
+// queued tensor data to the underlying writer in a single pass. After calling Close no further
+// [GGUFWriter.SetKV], [GGUFWriter.AddTensor], or [GGUFWriter.WriteTensorData] calls are valid.
+// Returns the total number of bytes written and any error encountered during finalization.
 func (w *GGUFWriter) Close() (int64, error) {
 	return w.sw.Close()
 }
@@ -163,7 +190,10 @@ func (w *GGUFWriter) Close() (int64, error) {
 // StreamWriter methods
 // ---------------------------------------------------------------------------
 
-// NewStreamWriter creates a new streaming GGUF writer wrapping an io.WriterAt.
+// NewStreamWriter creates a new [StreamWriter] that writes directly to the given [io.WriterAt].
+// Metadata entries can be added with [StreamWriter.SetMetadataEntry], tensors queued with
+// [StreamWriter.AddTensor] + [StreamWriter.WriteTensorData], and the file finalized with
+// [StreamWriter.Close]. Prefer this over [Create] when you already have an io.WriterAt (e.g., a file).
 func NewStreamWriter(w io.WriterAt) *StreamWriter {
 	return &StreamWriter{
 		w:           w,
@@ -173,7 +203,9 @@ func NewStreamWriter(w io.WriterAt) *StreamWriter {
 	}
 }
 
-// SetMetadataEntry adds or replaces a KV entry in the writer's metadata.
+// SetMetadataEntry adds or replaces a [KVEntry] in the writer's metadata section. If an entry with
+// the same key already exists, it is overwritten. Call before [StreamWriter.Close]. Safe to call
+// multiple times for the same key -- last write wins.
 func (w *StreamWriter) SetMetadataEntry(e KVEntry) error {
 	for i := range w.meta.pairs {
 		if w.meta.pairs[i].Key == e.Key {
@@ -182,10 +214,18 @@ func (w *StreamWriter) SetMetadataEntry(e KVEntry) error {
 		}
 	}
 	w.meta.pairs = append(w.meta.pairs, e)
+
+	// Auto-initialize when first metadata entry is added (in case no tensors are written)
+	if !w.initialized && len(w.meta.pairs) > 0 {
+		w.initialized = true
+	}
+
 	return nil
 }
 
-// AddTensor queues a tensor for writing.
+// AddTensor queues a tensor definition (name, shape, quantization type) for later writing.
+// Returns an index usable in [StreamWriter.WriteTensorData]. Call before [StreamWriter.Close];
+// the shape slice is copied internally so the caller may reuse it after this call returns.
 func (w *StreamWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType) uint64 {
 	info := TensorInfo{
 		Name:   name,
@@ -204,7 +244,10 @@ func (w *StreamWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType)
 	return idx
 }
 
-// WriteTensorData streams raw tensor bytes for a previously queued tensor.
+// WriteTensorData reads all bytes from r and associates them with the tensor at index idx
+// (returned by [StreamWriter.AddTensor]). The data must match exactly the size predicted by
+// the tensor's shape and GgmlType; a short or long read returns an error. Call in the same
+// order as AddTensor indices, before [StreamWriter.Close].
 func (w *StreamWriter) WriteTensorData(idx uint64, r io.Reader) error {
 	if int(idx) >= len(w.tensors) {
 		return fmt.Errorf("gguf: tensor index %d out of range", idx)
@@ -226,7 +269,10 @@ func (w *StreamWriter) WriteTensorData(idx uint64, r io.Reader) error {
 	return nil
 }
 
-// SetAlignment sets the alignment for tensor data section (must be multiple of 8).
+// SetAlignment sets the byte alignment for the start of the tensor-data section. Must be a
+// power-of-two multiple of 8 (default: 32). Higher alignment may improve sequential read
+// performance on some storage devices but wastes more space in small files. Call before any
+// [StreamWriter.AddTensor] or [StreamWriter.SetMetadataEntry].
 func (w *StreamWriter) SetAlignment(a uint64) {
 	if a == 0 {
 		a = defaultAlignment
@@ -235,7 +281,10 @@ func (w *StreamWriter) SetAlignment(a uint64) {
 	w.meta.alignment = a
 }
 
-// Close writes header + KV section + tensor metadata, then streams tensor data.
+// Close writes the GGUF header, KV section, tensor metadata section, alignment padding, and all
+// queued tensor data to the underlying [io.WriterAt] in a single pass. After calling Close no further
+// [StreamWriter.SetMetadataEntry], [StreamWriter.AddTensor], or [StreamWriter.WriteTensorData] calls are valid.
+// Returns the total number of bytes written and any error encountered during finalization.
 func (w *StreamWriter) Close() (int64, error) {
 	if !w.initialized {
 		return 0, fmt.Errorf("gguf: stream not initialized")
@@ -269,7 +318,19 @@ func (w *StreamWriter) Close() (int64, error) {
 		totalWritten += nw
 	}
 
-	// --- Write tensor metadata section at offset kvEnd ---
+	// --- Pre-compute data offsets for all tensors ---
+	dataPos := w.dataStart
+	for i := range w.tensors {
+		tb := &w.tensors[i]
+		if rem := dataPos % defaultAlignment; rem != 0 {
+			padLen := int64(defaultAlignment - rem)
+			dataPos += uint64(padLen) // Skip padding before this tensor
+		}
+		tb.info.Offset = dataPos - w.dataStart // Store offset relative to dataStart
+		dataPos += uint64(len(tb.data))
+	}
+
+	// --- Write tensor metadata section at offset kvEnd (with correct offsets now) ---
 	tensorMetaPos := int64(kvOff)
 	for _, tb := range w.tensors {
 		if err := writeTensorMeta(w.w, tensorMetaPos, tb.info); err != nil {
@@ -295,7 +356,9 @@ func (w *StreamWriter) Close() (int64, error) {
 
 	// --- Stream tensor data at pre-computed offsets ---
 	pos := w.dataStart
-	for _, tb := range w.tensors {
+	for i := range w.tensors {
+		tb := &w.tensors[i]
+		// Skip padding to align this tensor's data
 		if rem := pos % defaultAlignment; rem != 0 {
 			padLen := int64(defaultAlignment - rem)
 			padBuf := make([]byte, padLen)
