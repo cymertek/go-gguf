@@ -584,7 +584,7 @@ func (g *GGUF) detectSplit(sourcePath string) (*splitInfo, error) {
 	}
 
 	// Locate all shard files based on filename pattern
-	baseName := extractBaseName(sourcePath) // e.g., "DeepSeek-V4-Flash-0731-UD-IQ1_S" from path
+	baseName := extractBaseName(sourcePath) // e.g., "TestModel-V4-Flash-0731-UD-IQ1_S" from path
 
 	if baseName == "" {
 		return nil, fmt.Errorf("gguf: could not extract base name from %q", sourcePath)
@@ -759,7 +759,7 @@ func extractBaseName(path string) string {
 		return base // not a split file pattern
 	}
 
-	// parts[0] should be the base name (e.g., "DeepSeek-V4-Flash-0731-UD-IQ1_S-00001")
+	// parts[0] should be the base name (e.g., "TestModel-V4-Flash-0731-UD-IQ1_S-00001")
 	// parts[1] should be the shard number + extension (e.g., "00003.gguf")
 
 	// Extract just the base name part before the last "-"
@@ -1051,7 +1051,7 @@ func (g *GGUF) ShardIndex() int {
 }
 
 // IsSplit returns true when the underlying file is one shard of a multi-file split GGUF
-// (e.g., DeepSeek-V4). When true, [SplitInfo] will be non-nil and contains per-shard metadata.
+// (e.g., TestModel-V4). When true, [SplitInfo] will be non-nil and contains per-shard metadata.
 func (g *GGUF) IsSplit() bool {
 	return g.splitInfo != nil && len(g.splitInfo.shards) > 1
 }
@@ -1091,7 +1091,7 @@ func (g *GGUF) SplitInfo() *SplitInfo {
 	return info
 }
 
-// SplitInfo contains metadata about a multi-shard GGUF file (e.g., DeepSeek-V4).
+// SplitInfo contains metadata about a multi-shard GGUF file (e.g., TestModel-V4).
 // It reports the total number of shards, per-shard tensor counts from headers, and provides
 // [SplitShard] handles for reading each shard's metadata and tensors independently.
 type SplitInfo struct {

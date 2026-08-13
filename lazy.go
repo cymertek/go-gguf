@@ -15,7 +15,7 @@ const defaultAlignment = uint64(32)
 // ---------------------------------------------------------------------------
 
 // Open opens a GGUF file by path and returns a lazy [*GGUF] reader. If the file is part of
-// a multi-shard split (e.g., DeepSeek-V4 with files named "model-*-of-NNNNN.gguf"), it will
+// a multi-shard split (e.g., TestModel-V4 with files named "model-*-of-NNNNN.gguf"), it will
 // automatically detect all shards, validate header consistency across them, and combine into
 // a single logical [io.ReaderAt]. The returned *GGUF must be closed via [GGUF.Close] when done.
 //
@@ -684,33 +684,27 @@ func readFull(r io.ReaderAt, buf []byte, off int64) (int, error) {
 // Dequant convenience method on Tensor
 // ---------------------------------------------------------------------------
 
-// Bytes reads the entire tensor data into a newly allocated byte slice and returns it.
-// Use [Tensor.ReadAt] for partial or streaming reads instead; this method is convenient
-// for small tensors but allocates memory proportional to the full tensor size.
-func (t *Tensor) Bytes() ([]byte, error) {
-	buf := make([]byte, t.info.NBytes)
-
-	n, err := readFull(t.gguf.r, buf, int64(t.absOffset))
-	if err != nil {
-		return nil, fmt.Errorf("gguf: read tensor %s data: %w", t.info.Name, err)
+// Dequant reads the entire raw tensor data from file via streaming (no full allocation to []byte),
+// then calls [Dequant] to convert it into a []float32 slice of de-quantized values. For large tensors
+// this still allocates memory for the float slice; prefer reading chunks via [Tensor.ReadAt] or
+// [Tensor.Reader] with streaming dequantization for memory-constrained applications. The returned
+// slice must not be modified by the caller.
+func (t *Tensor) Dequant() ([]float32, error) {
+	r := t.Reader()
+	data := make([]byte, t.info.NBytes)
+	n, err := io.ReadFull(r, data)
+	if err != nil || n == 0 {
+		return nil, fmt.Errorf("gguf: read tensor %s for dequant: %w", t.info.Name, err)
 	}
-	if n == 0 {
-		return nil, fmt.Errorf("gguf: read tensor %s data: no bytes read", t.info.Name)
-	}
-
-	return buf[:n], nil
+	return Dequant(data[:n], t.info.GgmlType)
 }
 
-// Dequant reads the entire raw tensor data from file, then calls [Dequant] to convert it
-// into a []float32 slice of de-quantized values. For large tensors this allocates memory for
-// both the raw bytes and the float slice; prefer [Tensor.Data] + streaming dequantization
-// for memory-constrained applications. The returned slice must not be modified by the caller.
-func (t *Tensor) Dequant() ([]float32, error) {
-	data, err := t.Bytes()
-	if err != nil {
-		return nil, err
-	}
-	return Dequant(data, t.info.GgmlType)
+// Read reads up to len(dst) bytes from the tensor's raw data starting at offset 0. This is a
+// convenience wrapper around [Tensor.ReadAt] that returns an [io.Reader]-style interface for use in
+// streaming pipelines (e.g., io.Copy with another writer). The caller owns dst and must not modify it
+// while reading continues concurrently.
+func (t *Tensor) Read(dst []byte) (int, error) {
+	return t.ReadAt(dst, 0)
 }
 
 // Data returns an [io.ReaderAt] that reads from this tensor's raw data region in the underlying
@@ -723,6 +717,25 @@ func (t *Tensor) Data() (io.ReaderAt, error) {
 		off: int64(t.absOffset),
 		n:   int64(t.info.NBytes),
 	}, nil
+}
+
+// Reader returns an [io.ReadSeeker] that streams the tensor's raw binary data sequentially from
+// the underlying file. This is a [io.LimitedReader]-style wrapper: reads are limited to NBytes and
+// no dequantization or transformation is applied -- callers receive exactly the bytes as stored on
+// disk. Use this when feeding tensor data directly into another library (e.g., a custom tokenizer,
+// inference backend, or quantizer) that manages its own consumption rate and memory layout.
+//
+// Example -- stream raw Q4_0 bytes to an external quantizer:
+//
+//	tensors, _ := g.Tensors()
+//	for _, t := range tensors {
+//	    if t.Info().GgmlType == gguf.GgmlQ4_0 {
+//	        r := t.Reader() // io.ReadSeeker, limited to NBytes
+//	        externalLib.Feed(r)
+//	    }
+//	}
+func (t *Tensor) Reader() io.ReadSeeker {
+	return io.NewSectionReader(t.gguf.r, int64(t.absOffset), int64(t.info.NBytes))
 }
 
 // tensorReaderAt wraps an io.ReaderAt with a fixed offset and length.

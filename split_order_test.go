@@ -19,10 +19,10 @@ func TestMultiShardOrderValidation(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Copy the real DeepSeek-V4 split files to temp directory with reversed order
-	shard1 := "/workdir/DeepSeek-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf"
-	shard2 := "/workdir/DeepSeek-V4-Flash-0731-UD-IQ1_S-00002-of-00003.gguf"
-	shard3 := "/workdir/DeepSeek-V4-Flash-0731-UD-IQ1_S-00003-of-00003.gguf"
+	// Copy the real TestModel-V4 split files to temp directory with reversed order
+	shard1 := "/workdir/TestModel-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf"
+	shard2 := "/workdir/TestModel-V4-Flash-0731-UD-IQ1_S-00002-of-00003.gguf"
+	shard3 := "/workdir/TestModel-V4-Flash-0731-UD-IQ1_S-00003-of-00003.gguf"
 
 	// Create files in reverse order (3, 2, 1) to test sorting
 	destShard1 := filepath.Join(tmpDir, "model-00003-of-00003.gguf")
@@ -98,7 +98,7 @@ func TestMultiShardMismatchedCount(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Copy shard 1 (metadata-only with split.count=3) as both files
-	shard1 := "/workdir/DeepSeek-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf"
+	shard1 := "/workdir/TestModel-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf"
 	destShard1 := filepath.Join(tmpDir, "model-00001-of-00002.gguf")
 	destShard2 := filepath.Join(tmpDir, "model-00002-of-00002.gguf")
 
@@ -132,7 +132,7 @@ func TestMultiShardMissingShard(t *testing.T) {
 	defer os.RemoveAll(tmpDir)
 
 	// Copy only 2 out of 3 shards
-	shard1 := "/workdir/DeepSeek-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf"
+	shard1 := "/workdir/TestModel-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf"
 	destShard1 := filepath.Join(tmpDir, "model-00001-of-00003.gguf")
 	destShard2 := filepath.Join(tmpDir, "model-00002-of-00003.gguf")
 

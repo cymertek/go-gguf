@@ -12,10 +12,10 @@ func TestMultiShardSplit(t *testing.T) {
 		t.Skip("skipping multi-shard test in short mode")
 	}
 
-	// Use DeepSeek-V4 split files as test data
-	shard1Path := "/workdir/DeepSeek-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf"
+	// Use TestModel-V4 split files as test data
+	shard1Path := "/workdir/TestModel-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf"
 	if _, err := os.Stat(shard1Path); os.IsNotExist(err) {
-		t.Skip("DeepSeek-V4 split files not found, skipping test")
+		t.Skip("TestModel-V4 split files not found, skipping test")
 	}
 
 	g, err := Open(shard1Path)

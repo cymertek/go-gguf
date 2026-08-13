@@ -4,7 +4,7 @@ A pure Go library for reading and writing [GGUF](https://github.com/ggerganov/gg
 
 **Features:**
 - Lazy loading — only reads file headers initially (~56 bytes per file), walks KV/tensor sections on demand
-- Multi-shard support — automatically detects and combines split GGUF files (e.g., DeepSeek-V4)
+- Multi-shard support — automatically detects and combines split GGUF files
 - Zero-copy streaming — direct reader-to-writer transfers with optional filtering, transformation, and requantization
 - Buffer pooling — tiered sync.Pool for efficient memory reuse across files and tensors
 
@@ -53,7 +53,7 @@ func main() {
 }
 ```
 
-### Reading Multi-Shard GGUF Files (e.g., DeepSeek-V4)
+### Reading Multi-Shard GGUF Files
 
 ```go
 // Open any shard file — the library auto-detects and combines all shards
@@ -238,8 +238,9 @@ dst.Close()
 | `OpenForWrite` | `func OpenForWrite(path string) (*GGUFWriter, error)` | Create a writer for the given file path. |
 | `(*GGUFWriter).SetKV()` | `func (w *GGUFWriter) SetKV(key string, v Value) error` | Add or replace a key-value pair in the metadata section. |
 | `(*GGUFWriter).GetMetadata()` | `func (w *GGUFWriter) GetMetadata() []KVEntry` | Return copies of all KV entries currently queued for writing. |
-| `(*GGUFWriter).AddTensor()` | `func (w *GGUFWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType) uint64` | Queue a tensor to be written later. Returns the index for WriteTensorData. |
-| `(*GGUFWriter).WriteTensorData()` | `func (w *GGUFWriter) WriteTensorData(idx uint64, r io.Reader) error` | Stream raw tensor data for a previously queued tensor. |
+| `(*GGUFWriter).AddTensor()` | `func (w *GGUFWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType) uint64` | Queue a tensor definition; returns index for WriteTensorData/NewTensor. The reader is NOT consumed until Close(). |
+| `(*GGUFWriter).WriteTensorData()` | `func (w *GGUFWriter) WriteTensorData(idx uint64, r io.Reader) error` | Associate an io.Reader with the queued tensor at idx. Reader is deferred — bytes stream through 256 KB pooled buffer only during Close(). Memory usage O(1) regardless of tensor size. |
+| `(*GGUFWriter).NewTensor()` | `func (w *GGUFWriter) NewTensor(name string, shape []uint64, ggmlType GgmlType, r io.Reader) error` | Convenience: combines AddTensor + WriteTensorData in one call with deferred consumption. |
 | `(*GGUFWriter).NumTensors()` | `func (w *GGUFWriter) NumTensors() int` | Return number of queued tensors. |
 | `(*GGUFWriter).Close()` | `func (w *GGUFWriter) Close() (int64, error)` | Flush header + KV section + tensor metadata and stream tensor data. Returns total bytes written. |
 
@@ -247,9 +248,40 @@ dst.Close()
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `StreamCopy` | `func StreamCopy(dst *GGUFWriter, src *GGUF, opts StreamOptions) error` | Copy tensors from source GGUF to writer with optional filtering and transformation. |
-| `StreamRequantize` | `func StreamRequantize(dst *GGUFWriter, src *GGUF, targetType GgmlType) error` | Copy and requantize all tensors from src to dst in one call. |
-| `StreamMerge` | `func StreamMerge(dst *GGUFWriter, sources []*GGUF, opts StreamOptions) error` | Merge tensors from multiple GGUF files into a single writer. KV metadata comes from the first source only. |
+| `StreamCopy` | `func StreamCopy(dst *GGUFWriter, src *GGUF, opts StreamOptions) error` | Copy tensors from source GGUF to writer with optional filtering and transformation. Passthrough copies stream directly without loading into memory; transforms/requantize require full data in memory. |
+| `StreamRequantize` | `func StreamRequantize(dst *GGUFWriter, src *GGUF, targetType GgmlType) error` | Copy and requantize all tensors from src to dst in one call. Requires full tensor data in memory for dequant/requant cycle. |
+| `StreamMerge` | `func StreamMerge(dst *GGUFWriter, sources []*GGUF, opts StreamOptions) error` | Merge tensors from multiple GGUF files into a single writer. KV metadata comes from the first source only. Later sources' metadata entries are skipped to avoid key conflicts. |
+
+### Deferred-Consumption Streaming Writer
+
+The writer uses **deferred consumption** for tensor data — bytes are NOT loaded into memory when `AddTensor`/`WriteTensorData`/`NewTensor` is called. Instead, the underlying `io.Reader` reference is stored and streamed through a 256 KB pooled buffer only during `Close()`. This enables writing tensors larger than available RAM without allocation pressure.
+
+**How it works:**
+1. Call `AddTensor(name, shape, type)` to queue tensor definition — returns index
+2. Call `WriteTensorData(idx, reader)` or `NewTensor(name, shape, type, reader)` with any `io.Reader` (network stream, file handle, byte buffer)
+3. The reader is NOT consumed at this point — only stored as a reference
+4. On `Close()`, the writer streams each tensor's bytes through a 256 KB pooled buffer directly to disk
+
+**Memory efficiency:** RAM usage stays O(1) per in-flight tensor regardless of size (only the streaming window buffer + small struct overhead). A 10 GB tensor writes with ~256 KB peak memory, not 10 GB.
+
+```go
+// Example: Stream a large tensor from a network connection without loading it into memory
+w := gguf.Create(outFile)
+idx := w.AddTensor("huge.weight", []uint64{largeDimension}, gguf.GgmlQ4_0)
+
+// Pass any io.Reader — the library streams bytes at Close() time, not now
+err := w.WriteTensorData(idx, networkConn)  // No ReadFull here; reader stored for deferred consumption
+
+// Or use NewTensor convenience method (same deferred behavior)
+err = w.NewTensor("another.weight", shape, ggmlType, someReader)
+
+// Close() is where actual streaming happens — only a pooled buffer in RAM at any time
+nWritten, err := w.Close()  // Streams each tensor through ~256KB window to disk
+```
+
+**Passthrough vs Transform paths:**
+- **Passthrough** (no transform/requantize): Source reader streams directly to writer via deferred consumption — zero-copy, O(1) memory
+- **Transform/Requantize**: Requires full data in memory for processing, then writes through normal streaming path
 
 ### Metadata Operations
 
@@ -296,12 +328,38 @@ type GGUF struct {
 
 ### `Tensor` — File-Backed Tensor Handle
 
-Wraps `TensorInfo` with a per-tensor read cache that avoids disk seeks for repeated reads of the same region.
+Wraps `TensorInfo` with a per-tensor read cache that avoids disk seeks for repeated reads of the same region. Provides streaming access methods for reading tensor data without loading it entirely into memory.
 
 ```go
 type Tensor struct {
     // Has unexported fields.
 }
+```
+
+**Streaming read methods (no full allocation):**
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `Reader()` | `io.ReadSeeker` | LimitedReader-style sequential reader over tensor bytes. Use for streaming to other libraries or `io.Copy`. |
+| `Data()` | `io.ReaderAt` | Seekable reader at aligned file offset. Fixed length = NBytes. Useful for random-access reads without cache. |
+| `Read(dst []byte)` | `(int, error)` | Convenience wrapper around `ReadAt(dst, 0)` for `io.Reader`-style usage. |
+| `ReadAt(dst []byte, off int64)` | `(int, error)` | Partial read with per-tensor cache overlap optimization. First call reads 1 MB aligned chunk into internal cache; subsequent calls within that range serve from memory without disk I/O. |
+
+**Example — stream tensor to external library:**
+```go
+tensors, _ := g.Tensors()
+for _, t := range tensors {
+    r := t.Reader()  // io.ReadSeeker, limited to NBytes
+    externalLib.Feed(r)  // Library reads at its own pace
+}
+```
+
+**Example — partial read with caching:**
+```go
+t := tensors[0]
+buf := make([]byte, 4096)
+n, _ := t.ReadAt(buf, 1024)  // First call: disk seek + cache fill
+n, _ = t.ReadAt(buf, 2048)   // Second call within same 1MB window: cache hit (no disk I/O)
 ```
 
 ### `TensorInfo` — Parsed Tensor Metadata

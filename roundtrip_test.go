@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"os"
 	"testing"
 )
@@ -154,10 +155,11 @@ func TestRoundTripFile(t *testing.T) {
 			t.Errorf("Tensor[%d].GgmlType = %v, want %v", i, ti.GgmlType, tn.ggmlType)
 		}
 
-		// Verify tensor data matches byte-for-byte
-		dataRead, err := tr.Bytes()
+		// Verify tensor data matches byte-for-byte (streamed read)
+		r := tr.Reader()
+		dataRead, err := io.ReadAll(r)
 		if err != nil {
-			t.Fatalf("Bytes(%s): %v", tn.name, err)
+			t.Fatalf("read tensor %s: %v", tn.name, err)
 		}
 		if len(dataRead) != len(tn.data) {
 			t.Errorf("Tensor[%d] data size mismatch: got %d bytes, want %d", i, len(dataRead), len(tn.data))

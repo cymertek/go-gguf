@@ -22,7 +22,7 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatalf("OpenForWrite: %v", err)
 	}
 
-	gw.SetKV("general.architecture", Value{Str: "qwen35", BType: BTypeString})
+	gw.SetKV("general.architecture", Value{Str: "test35", BType: BTypeString})
 	gw.SetKV("general.file_type", Value{Int: 2, BType: BTypeUint32})
 
 	shape := []uint64{4, 8}
@@ -98,9 +98,10 @@ func TestRoundTrip(t *testing.T) {
 		t.Errorf("ggml type = %v, want F32", ti.GgmlType)
 	}
 
-	readData, err := tensors[0].Bytes()
+	r := tensors[0].Reader()
+	readData, err := io.ReadAll(r)
 	if err != nil {
-		t.Fatalf("Tensor.Bytes: %v", err)
+		t.Fatalf("read tensor data: %v", err)
 	}
 	if !bytes.Equal(data, readData) {
 		t.Errorf("tensor data mismatch - first 8 bytes written: %v, read: %v", data[:8], readData[:8])

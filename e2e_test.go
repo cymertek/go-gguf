@@ -1,6 +1,7 @@
 package gguf
 
 import (
+	"io"
 	"os"
 	"testing"
 )
@@ -50,8 +51,8 @@ func TestEndToEndBonsai(t *testing.T) {
 		// Check that we got the expected architecture string
 		if entry.Name() == "general.architecture" {
 			s, _ := v.AsString()
-			if s != "qwen3" {
-				t.Errorf("expected 'qwen3', got %q", s)
+			if s != "test3" {
+				t.Errorf("expected 'test3', got %q", s)
 			}
 		}
 	}
@@ -124,15 +125,16 @@ func TestEndToEndBonsai(t *testing.T) {
 	for _, tensor := range tensors[:min(10, len(tensors))] {
 		info := tensor.Info()
 		if info.GgmlType == GgmlF32 || info.GgmlType == GgmlQ4_0 {
-			data, err := tensor.Bytes()
+			r := tensor.Reader()
+			data, err := io.ReadAll(r)
 			if err != nil {
-				t.Errorf("Bytes for %s: %v", info.Name, err)
+				t.Errorf("Read tensor %s: %v", info.Name, err)
 				continue
 			}
-			t.Logf("%s: %d bytes raw data", info.Name, len(data))
+			t.Logf("%s: %d bytes raw data (streamed)", info.Name, len(data))
 
 			// Try dequantizing (may fail for unsupported types)
-			if data, err := tensor.Bytes(); err == nil && len(data) > 0 {
+			if len(data) > 0 {
 				deq, err := Dequant(data, info.GgmlType)
 				if err != nil {
 					t.Logf("Dequant error (expected for some types): %v", err)

@@ -3,6 +3,7 @@ package gguf
 import (
 	"bytes"
 	"fmt"
+	"io"
 )
 
 // StreamOptions configures streaming operations ([StreamCopy], [StreamMerge]). All fields are optional;
@@ -36,6 +37,11 @@ type StreamOptions struct {
 // on-the-fly requantization via [StreamOptions.TargetType], and custom per-tensor transforms via
 // [StreamOptions.Transform]. Returns the first error encountered during reading or writing.
 //
+// For passthrough copies (no transform, no requantize) data streams directly from source to writer
+// through a 256 KB pooled buffer -- tensors larger than available RAM are handled without loading
+// the full tensor into memory. Requantization and transforms require full data in memory since they
+// must process every byte before writing.
+//
 // Example -- copy all tensors from a Q4_0 model to a new F32 file:
 //
 //	src, err := gguf.Open("model-q4.gguf")
@@ -61,49 +67,59 @@ func StreamCopy(dst *GGUFWriter, src *GGUF, opts StreamOptions) error {
 			continue
 		}
 
-		// Get raw tensor data
-		data, err := t.Bytes()
-		if err != nil {
-			return fmt.Errorf("gguf: read tensor %s: %w", info.Name, err)
+		// Determine target type (may differ after requantization or transform)
+		targetType := info.GgmlType
+		if opts.TargetType.IsSupported() && opts.TargetType != info.GgmlType {
+			targetType = opts.TargetType
 		}
 
-		// Apply transformations
+		idx := dst.AddTensor(info.Name, info.Shape, targetType)
+
+		// Apply transformations if needed (requires full data in memory)
+		var transformFn func([]byte, TensorInfo) ([]byte, error)
 		if opts.Transform != nil {
-			var transformErr error
-			data, transformErr = opts.Transform(data, info)
-			if transformErr != nil {
-				return transformErr
+			transformFn = opts.Transform
+		} else if opts.TargetType.IsSupported() && opts.TargetType != info.GgmlType {
+			// Wrap requantize as a transform function for unified handling below
+			srcType := info.GgmlType
+			targetT := opts.TargetType
+			transformFn = func(data []byte, _ TensorInfo) ([]byte, error) {
+				floats, err := Dequant(data, srcType)
+				if err != nil {
+					return nil, fmt.Errorf("dequant %s: %w", info.Name, err)
+				}
+				newData, err := Requant(floats, targetT)
+				if err != nil {
+					return nil, fmt.Errorf("requant %s: %w", info.Name, err)
+				}
+				return newData, nil
 			}
-			if data == nil {
+		}
+
+		if transformFn != nil {
+			// Transform/requantize requires full data in memory — read via streaming reader
+			reader := t.Reader()
+			data, err := io.ReadAll(reader)
+			if err != nil {
+				return fmt.Errorf("gguf: read tensor %s for transform: %w", info.Name, err)
+			}
+
+			newData, err := transformFn(data, info)
+			if err != nil {
+				return err
+			}
+			if newData == nil {
 				continue // Skip tensor
 			}
-		}
 
-		// Apply requantization
-		if opts.TargetType.IsSupported() && opts.TargetType != info.GgmlType {
-			// Dequantize data
-			floats, err := Dequant(data, info.GgmlType)
-			if err != nil {
-				return fmt.Errorf("gguf: dequant %s: %w", info.Name, err)
+			if err := dst.WriteTensorData(idx, bytes.NewReader(newData)); err != nil {
+				return fmt.Errorf("gguf: write transformed tensor %s data: %w", info.Name, err)
 			}
-			// Requantize to target type
-			newData, err := Requant(floats, opts.TargetType)
-			if err != nil {
-				return fmt.Errorf("gguf: requant %s: %w", info.Name, err)
-			}
-			data = newData
+			continue
 		}
 
-		// Add tensor to writer
-		tinfo := info
-		if opts.TargetType != info.GgmlType {
-			tinfo.GgmlType = opts.TargetType
-		}
-		idx := dst.AddTensor(info.Name, tinfo.Shape, tinfo.GgmlType)
-
-		// Create reader from data bytes
-		reader := bytes.NewReader(data)
-		if err := dst.WriteTensorData(idx, reader); err != nil {
+		// Zero-copy passthrough: pass source reader directly to writer for deferred streaming at Close()
+		if err := dst.WriteTensorData(idx, t.Reader()); err != nil {
 			return fmt.Errorf("gguf: write tensor %s data: %w", info.Name, err)
 		}
 	}

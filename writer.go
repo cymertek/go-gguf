@@ -43,10 +43,13 @@ func newWriterMeta() *writerMeta {
 	}
 }
 
-// tensorBuf holds a queued tensor's info and its raw data bytes.
+// tensorBuf holds a queued tensor's definition and its deferred reader reference. The reader is NOT
+// consumed at AddTensor/WriteTensorData/NewTensor time -- bytes stream from it through a small pooled
+// buffer only when [StreamWriter.Close] writes to disk, keeping RAM usage O(1) regardless of tensor
+// size (tensors larger than available RAM work without allocation pressure).
 type tensorBuf struct {
-	info TensorInfo
-	data []byte // nil until WriteTensorData is called
+	info   TensorInfo
+	reader io.Reader
 }
 
 // ---------------------------------------------------------------------------
@@ -155,10 +158,28 @@ func (w *GGUFWriter) GetMetadata() []KVEntry {
 	return result
 }
 
+// NewTensor queues a tensor definition and immediately consumes raw bytes from r to back it. This
+// is equivalent to calling [GGUFWriter.AddTensor] followed by [GGUFWriter.WriteTensorData], but
+// accepts any [io.Reader] directly (including network streams, file handles, or byte buffers) so the
+// caller does not need to manage an intermediate []byte slice. The reader is consumed fully via
+// [io.ReadFull]; the tensor's data size must match what is predicted by shape × GgmlType. Call
+// before [GGUFWriter.Close].
+//
+// Example -- stream a tensor directly from a network connection:
+//
+//	w := gguf.Create(file)
+//	err := w.NewTensor("model.layers.0.attn_q.weight", []uint64{4096, 12288}, gguf.GgmlQ4_0, conn)
+//	if err != nil { log.Fatal(err) }
+func (w *GGUFWriter) NewTensor(name string, shape []uint64, ggmlType GgmlType, r io.Reader) error {
+	return w.sw.NewTensor(name, shape, ggmlType, r)
+}
+
 // AddTensor queues a tensor definition (name, shape, quantization type) to be written later.
-// Returns an index that must be passed to [GGUFWriter.WriteTensorData] to stream the raw bytes.
-// Call in any order; data is written sequentially at [GGUFWriter.Close]. The shape slice is copied
-// internally so the caller may reuse it after this call returns.
+// Returns an index that must be passed to [GGUFWriter.WriteTensorData] or [GGUFWriter.NewTensor]
+// to stream the raw bytes. Call in any order; data is written sequentially at [GGUFWriter.Close].
+// The shape slice is copied internally so the caller may reuse it after this call returns. Prefer
+// [GGUFWriter.NewTensor] when you already have an io.Reader for the data -- it combines definition
+// and streaming into a single call.
 func (w *GGUFWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType) uint64 {
 	idx := w.sw.AddTensor(name, shape, ggmlType)
 	return idx
@@ -223,13 +244,25 @@ func (w *StreamWriter) SetMetadataEntry(e KVEntry) error {
 	return nil
 }
 
-// AddTensor queues a tensor definition (name, shape, quantization type) for later writing.
-// Returns an index usable in [StreamWriter.WriteTensorData]. Call before [StreamWriter.Close];
-// the shape slice is copied internally so the caller may reuse it after this call returns.
+// NewTensor queues a tensor definition and associates it with an [io.Reader] whose bytes will be
+// streamed to disk at [StreamWriter.Close]. The reader is NOT consumed here -- only stored for
+// deferred reading through a small pooled buffer during final write. This keeps memory usage O(1)
+// regardless of tensor size, so tensors larger than available RAM work without allocation pressure.
+// Call before [StreamWriter.Close]; the shape slice and reader reference are retained until Close.
+func (w *StreamWriter) NewTensor(name string, shape []uint64, ggmlType GgmlType, r io.Reader) error {
+	idx := w.AddTensor(name, shape, ggmlType)
+	return w.queueReader(idx, r)
+}
+
+// AddTensor queues a tensor definition (name, shape, quantization type) for later writing. Returns
+// an index usable in [StreamWriter.WriteTensorData] or [StreamWriter.NewTensor]. Call before Close;
+// the shape slice is copied internally so the caller may reuse it after this call returns. Prefer
+// [StreamWriter.NewTensor] when you already have an io.Reader -- it avoids holding tensor data in
+// memory before Close writes to disk.
 func (w *StreamWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType) uint64 {
 	info := TensorInfo{
-		Name:   name,
-		Shape:  shape,
+		Name:     name,
+		Shape:    shape,
 		GgmlType: ggmlType,
 	}
 
@@ -244,28 +277,28 @@ func (w *StreamWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType)
 	return idx
 }
 
-// WriteTensorData reads all bytes from r and associates them with the tensor at index idx
-// (returned by [StreamWriter.AddTensor]). The data must match exactly the size predicted by
-// the tensor's shape and GgmlType; a short or long read returns an error. Call in the same
-// order as AddTensor indices, before [StreamWriter.Close].
+// WriteTensorData associates an [io.Reader] with the tensor at index idx (returned by AddTensor). The
+// reader's bytes are NOT consumed here -- they stream to disk at Close via a small pooled buffer, so
+// tensors larger than available RAM work without allocation pressure. Call in the same order as
+// AddTensor indices, before [StreamWriter.Close].
 func (w *StreamWriter) WriteTensorData(idx uint64, r io.Reader) error {
+	return w.queueReader(idx, r)
+}
+
+// queueReader stores a deferred reader for the tensor at idx and validates that computeDataSize
+// returns a non-zero expected size (otherwise NBytes is unknown and we cannot stream safely).
+func (w *StreamWriter) queueReader(idx uint64, r io.Reader) error {
 	if int(idx) >= len(w.tensors) {
 		return fmt.Errorf("gguf: tensor index %d out of range", idx)
 	}
 
 	tb := &w.tensors[idx]
-
 	expectedSz := computeDataSize(tb.info)
-	data := make([]byte, expectedSz)
-	n, err := io.ReadFull(r, data)
-	if err != nil {
-		return fmt.Errorf("gguf: read tensor %s data: %w", tb.info.Name, err)
-	}
-	if uint64(n) != expectedSz {
-		return fmt.Errorf("gguf: tensor %s: short write %d/%d bytes", tb.info.Name, n, expectedSz)
+	if expectedSz == 0 {
+		return fmt.Errorf("gguf: tensor %s: shape/type combination has no known data size (GgmlType=%d)", tb.info.Name, tb.info.GgmlType)
 	}
 
-	tb.data = data
+	tb.reader = r
 	return nil
 }
 
@@ -318,7 +351,7 @@ func (w *StreamWriter) Close() (int64, error) {
 		totalWritten += nw
 	}
 
-	// --- Pre-compute data offsets for all tensors ---
+	// --- Pre-compute data offsets for all tensors (sizes derived from shape × GgmlType, no data read yet) ---
 	dataPos := w.dataStart
 	for i := range w.tensors {
 		tb := &w.tensors[i]
@@ -326,8 +359,12 @@ func (w *StreamWriter) Close() (int64, error) {
 			padLen := int64(defaultAlignment - rem)
 			dataPos += uint64(padLen) // Skip padding before this tensor
 		}
+		nBytes := computeDataSize(tb.info)
 		tb.info.Offset = dataPos - w.dataStart // Store offset relative to dataStart
-		dataPos += uint64(len(tb.data))
+		if nBytes == 0 {
+			return totalWritten, fmt.Errorf("gguf: tensor %s has unknown NBytes (shape/type combination unsupported)", tb.info.Name)
+		}
+		dataPos += nBytes
 	}
 
 	// --- Write tensor metadata section at offset kvEnd (with correct offsets now) ---
@@ -354,10 +391,12 @@ func (w *StreamWriter) Close() (int64, error) {
 		totalWritten += int64(nw)
 	}
 
-	// --- Stream tensor data at pre-computed offsets ---
+	// --- Stream tensor data from deferred readers through a small pooled buffer ---
+	const streamBufSize = 256 << 10 // 256 KB streaming window; keeps RAM usage O(1) per tensor
 	pos := w.dataStart
 	for i := range w.tensors {
 		tb := &w.tensors[i]
+
 		// Skip padding to align this tensor's data
 		if rem := pos % defaultAlignment; rem != 0 {
 			padLen := int64(defaultAlignment - rem)
@@ -370,16 +409,37 @@ func (w *StreamWriter) Close() (int64, error) {
 			pos += uint64(padLen)
 		}
 
-		if tb.data == nil {
-			return totalWritten, fmt.Errorf("gguf: tensor %s has no data", tb.info.Name)
+		r := tb.reader
+		if r == nil {
+			return totalWritten, fmt.Errorf("gguf: tensor %s has no reader (did you call WriteTensorData/NewTensor?)", tb.info.Name)
 		}
 
-		nw, err := w.w.WriteAt(tb.data, int64(pos))
-		if err != nil {
-			return totalWritten, fmt.Errorf("gguf: write tensor %s data: %w", tb.info.Name, err)
+		buf := getBuffer(streamBufSize)[:streamBufSize]
+		expectedSz := computeDataSize(tb.info)
+		var wrote uint64
+		for wrote < expectedSz {
+			n, err := r.Read(buf)
+			if n > 0 {
+				wrote += uint64(n)
+				nw, err2 := w.w.WriteAt(buf[:n], int64(pos))
+				if err2 != nil {
+					return totalWritten, fmt.Errorf("gguf: write tensor %s data: %w", tb.info.Name, err2)
+				}
+				totalWritten += int64(nw)
+				pos += uint64(nw)
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return totalWritten, fmt.Errorf("gguf: read tensor %s data: %w", tb.info.Name, err)
+			}
 		}
-		totalWritten += int64(nw)
-		pos += uint64(len(tb.data))
+
+		if wrote != expectedSz {
+			return totalWritten, fmt.Errorf("gguf: tensor %s: short stream %d/%d bytes (reader ended early)", tb.info.Name, wrote, expectedSz)
+		}
+		putBuffer(buf)
 	}
 
 	return totalWritten, nil

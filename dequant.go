@@ -70,7 +70,7 @@ func float16asF32(bits uint16) float32 {
 var f16tab [65536]float32
 
 func init() {
-	for i := 0; i < 65536; i++ {
+	for i := range 65536 {
 		f16tab[i] = float16asF32(uint16(i))
 	}
 }
@@ -82,8 +82,8 @@ func dequantF32(data []byte) ([]float32, error) {
 	}
 	n := len(data) / 4
 	out := make([]float32, n)
-	for i := 0; i < n; i++ {
-		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[i*4 : i*4+4]))
+	for i := range n {
+		out[i] = math.Float32frombits(binary.LittleEndian.Uint32(data[i*4 : (i+1)*4]))
 	}
 	return out, nil
 }
@@ -98,11 +98,11 @@ func dequantQ4_0(data []byte) ([]float32, error) {
 	}
 
 	out := make([]float32, 0, numBlocks*32)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := data[b*blockSz : (b+1)*blockSz]
 		scale := f16tab[binary.LittleEndian.Uint16(block[0:2])]
 
-		for i := 0; i < 16; i++ {
+		for i := range 16 {
 			q := block[2+i]
 			out = append(out, scale*float32(int(q&0x0f)-8))
 			out = append(out, scale*float32(int((q>>4)&0x0f)-8))
@@ -121,12 +121,12 @@ func dequantQ5_0(data []byte) ([]float32, error) {
 	}
 
 	out := make([]float32, 0, numBlocks*32)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := data[b*blockSz : (b+1)*blockSz]
 		scale := f16tab[binary.LittleEndian.Uint16(block[0:2])]
 		qh := block[2:6]
 
-		for i := 0; i < 16; i++ {
+		for i := range 16 {
 			q := block[6+i]
 			h := int(qh[i/8]>>(i%8)) & 1
 
@@ -152,11 +152,11 @@ func dequantQ8_0(data []byte) ([]float32, error) {
 	}
 
 	out := make([]float32, 0, numBlocks*32)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := data[b*blockSz : (b+1)*blockSz]
 		scale := f16tab[binary.LittleEndian.Uint16(block[0:2])]
 
-		for i := 0; i < 32; i++ {
+		for i := range 32 {
 			v := int(block[2+i]) - 128
 			out = append(out, scale*float32(v))
 		}
@@ -173,7 +173,7 @@ func dequantQ2K(data []byte) ([]float32, error) {
 	}
 
 	out := make([]float32, 0, numBlocks*256)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := data[b*blockSz : (b+1)*blockSz]
 
 		d := f16tab[binary.LittleEndian.Uint16(block[58:60])]
@@ -182,7 +182,7 @@ func dequantQ2K(data []byte) ([]float32, error) {
 		scales := block[0:16]
 		qs := block[16:80]
 
-		for i := 0; i < 64; i++ {
+		for i := range 64 {
 			sIdx := i / 4
 			nIdx := i % 4
 
@@ -203,7 +203,7 @@ func dequantQ3K(data []byte) ([]float32, error) {
 	}
 
 	out := make([]float32, 0, numBlocks*256)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := data[b*blockSz : (b+1)*blockSz]
 
 		d := f16tab[binary.LittleEndian.Uint16(block[58:60])]
@@ -235,7 +235,7 @@ func dequantQ3K(data []byte) ([]float32, error) {
 		baseScales2 := [4]int{s1, s4, s7, s10}
 		baseScales3 := [4]int{s2, s5, s8, s11}
 
-		for i := 0; i < 256; i++ {
+		for i := range 256 {
 			var val int
 			off := i % 64
 			if off < 64 {
@@ -275,12 +275,12 @@ func dequantQ4K(data []byte) ([]float32, error) {
 	}
 
 	out := make([]float32, 0, numBlocks*256)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := data[b*blockSz : (b+1)*blockSz]
 
 		s := f16tab[binary.LittleEndian.Uint16(block[0:2])]
 
-		for i := 0; i < 256; i++ {
+		for range 256 {
 			out = append(out, s)
 		}
 	}
@@ -296,12 +296,12 @@ func dequantQ5K(data []byte) ([]float32, error) {
 	}
 
 	out := make([]float32, 0, numBlocks*256)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := data[b*blockSz : (b+1)*blockSz]
 
 		d := f16tab[binary.LittleEndian.Uint16(block[0:2])]
 
-		for i := 0; i < 256; i++ {
+		for range 256 {
 			out = append(out, d)
 		}
 	}
@@ -317,12 +317,12 @@ func dequantQ6K(data []byte) ([]float32, error) {
 	}
 
 	out := make([]float32, 0, numBlocks*256)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := data[b*blockSz : (b+1)*blockSz]
 
 		scale := f16tab[binary.LittleEndian.Uint16(block[96:98])]
 
-		for i := 0; i < 256; i++ {
+		for range 256 {
 			out = append(out, scale)
 		}
 	}
@@ -336,7 +336,8 @@ func dequantQ6K(data []byte) ([]float32, error) {
 //
 // Example -- dequantize a Q8_0 tensor:
 //
-//	data := tensor.Bytes()  // raw bytes from gguf.Tensor
+//	r := tensor.Reader()  // io.ReadSeeker streaming from file
+//	data, _ := io.ReadAll(r)
 //	f32s, err := gguf.Dequant(data, gguf.GgmlQ8_0)
 func Dequant(data []byte, t GgmlType) ([]float32, error) {
 	switch t {
@@ -441,13 +442,10 @@ func requantQ4_0(data []float32) ([]byte, error) {
 	blockSz := 32
 	numBlocks := (len(data) + blockSz - 1) / blockSz
 	out := make([]byte, numBlocks*18)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := out[b*18 : (b+1)*18]
 		start := b * blockSz
-		end := start + blockSz
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(start+blockSz, len(data))
 		// Find max absolute value for scale
 		maxAbs := float32(0)
 		for i := start; i < end; i++ {
@@ -465,9 +463,9 @@ func requantQ4_0(data []float32) ([]byte, error) {
 		}
 		binary.LittleEndian.PutUint16(block[0:2], f32toF16(scale))
 
-		for i := 0; i < 16 && i*2+start < end; i++ {
-			q0 := int(float32(-8+roundToNearest(data[i*2+start]/scale, 1)))
-			q1 := int(float32(-8+roundToNearest(data[i*2+1+start]/scale, 1)))
+		for i := range min(16, (end-start+1)/2) {
+			q0 := int(float32(-8 + roundToNearest(data[i*2+start]/scale, 1)))
+			q1 := int(float32(-8 + roundToNearest(data[i*2+1+start]/scale, 1)))
 			block[2+i] = byte(q0&0x0f) | byte((q1&0x0f) << 4)
 		}
 	}
@@ -478,13 +476,10 @@ func requantQ5_0(data []float32) ([]byte, error) {
 	blockSz := 32
 	numBlocks := (len(data) + blockSz - 1) / blockSz
 	out := make([]byte, numBlocks*22)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := out[b*22 : (b+1)*22]
 		start := b * blockSz
-		end := start + blockSz
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(start+blockSz, len(data))
 		maxAbs := float32(0)
 		for i := start; i < end; i++ {
 			a := data[i]
@@ -532,13 +527,10 @@ func requantQ8_0(data []float32) ([]byte, error) {
 	blockSz := 32
 	numBlocks := (len(data) + blockSz - 1) / blockSz
 	out := make([]byte, numBlocks*34)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := out[b*34 : (b+1)*34]
 		start := b * blockSz
-		end := start + blockSz
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(start+blockSz, len(data))
 
 		maxAbs := float32(0)
 		for i := start; i < end; i++ {
@@ -556,7 +548,7 @@ func requantQ8_0(data []float32) ([]byte, error) {
 		}
 		binary.LittleEndian.PutUint16(block[0:2], f32toF16(scale))
 
-		for i := 0; i < 32 && start+i < len(data); i++ {
+		for i := range min(32, (end-start+1)) {
 			block[2+i] = byte(128 + int(float32(-128+roundToNearest(data[start+i]/scale, 1))))
 		}
 	}
@@ -568,13 +560,10 @@ func requantQ2K(data []float32) ([]byte, error) {
 	numBlocks := (len(data) + blockSz - 1) / blockSz
 	out := make([]byte, numBlocks*64)
 
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := out[b*64 : (b+1)*64]
 		start := b * blockSz
-		end := start + blockSz
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(start+blockSz, len(data))
 
 		// Initialize all-zero block
 		for i := range block {
@@ -582,7 +571,7 @@ func requantQ2K(data []float32) ([]byte, error) {
 		}
 
 		// For each sub-block of 4 values (64 sub-blocks total per block)
-		for sb := 0; sb < 64; sb++ {
+		for sb := range 64 {
 			si := start + sb
 			if si >= end {
 				break
@@ -607,7 +596,7 @@ func requantQ2K(data []float32) ([]byte, error) {
 			}
 
 			// Quantize to 2 bits with scale
-			for i := 0; i < 4; i++ {
+			for i := range 4 {
 				q := int(float32(roundToNearest(data[si+i]/bestScale, 4)))
 				// Store in bit positions
 				block[sb/2] |= byte(q) << (sb%2 * 2)
@@ -674,17 +663,14 @@ func requantQ3K(data []float32) ([]byte, error) {
 	numBlocks := (len(data) + blockSz - 1) / blockSz
 	out := make([]byte, numBlocks*62)
 
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := out[b*62 : (b+1)*62]
 		start := b * blockSz
-		end := start + blockSz
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(start+blockSz, len(data))
 
 		// Simple Q3_K: use single scale for entire block
 		maxAbs := float32(0)
-		for i := start; i < end && i < len(data); i++ {
+		for i := start; i < end; i++ {
 			a := data[i]
 			if a < 0 {
 				a = -a
@@ -699,7 +685,7 @@ func requantQ3K(data []float32) ([]byte, error) {
 		}
 		binary.LittleEndian.PutUint16(block[58:60], uint16(math.Float32bits(scale)))
 
-		for i := 0; i < 256 && start+i < len(data); i++ {
+		for i := range min(256, end-start) {
 			q := int(roundToNearest(data[start+i]/scale, 64)) - 32
 			// Store 3 bits: lower 2 in qs, upper 1 in bits
 			qsIdx := i
@@ -716,17 +702,14 @@ func requantQ4K(data []float32) ([]byte, error) {
 	numBlocks := (len(data) + blockSz - 1) / blockSz
 	out := make([]byte, numBlocks*70)
 
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := out[b*70 : (b+1)*70]
 		start := b * blockSz
-		end := start + blockSz
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(start+blockSz, len(data))
 
 		// Simple Q4_K: single-scale 4-bit quantization
 		maxAbs := float32(0)
-		for i := start; i < end && i < len(data); i++ {
+		for i := start; i < end; i++ {
 			a := data[i]
 			if a < 0 {
 				a = -a
@@ -765,16 +748,13 @@ func requantQ5K(data []float32) ([]byte, error) {
 	numBlocks := (len(data) + blockSz - 1) / blockSz
 	out := make([]byte, numBlocks*76)
 
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := out[b*76 : (b+1)*76]
 		start := b * blockSz
-		end := start + blockSz
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(start+blockSz, len(data))
 
 		maxAbs := float32(0)
-		for i := start; i < end && i < len(data); i++ {
+		for i := start; i < end; i++ {
 			a := data[i]
 			if a < 0 {
 				a = -a
@@ -789,7 +769,7 @@ func requantQ5K(data []float32) ([]byte, error) {
 		}
 		binary.LittleEndian.PutUint16(block[0:2], f32toF16(scale))
 
-		for i := 0; i < 256 && start+i < len(data); i++ {
+		for i := range min(256, end-start) {
 			q := int(roundToNearest(data[start+i]/scale, 32))
 			if q >= 32 {
 				q = 31
@@ -813,16 +793,13 @@ func requantQ6K(data []float32) ([]byte, error) {
 	numBlocks := (len(data) + blockSz - 1) / blockSz
 	out := make([]byte, numBlocks*98)
 
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := out[b*98 : (b+1)*98]
 		start := b * blockSz
-		end := start + blockSz
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(start+blockSz, len(data))
 
 		maxAbs := float32(0)
-		for i := start; i < end && i < len(data); i++ {
+		for i := start; i < end; i++ {
 			a := data[i]
 			if a < 0 {
 				a = -a
@@ -879,21 +856,21 @@ func dequantNVFP4(data []byte) ([]float32, error) {
 	}
 
 	out := make([]float32, 0, numBlocks*64)
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := data[b*blockSz : (b+1)*blockSz]
 
 		// Decode 4 UE4M3 sub-scales
 		var scales [4]float32
-		for s := 0; s < 4; s++ {
+		for s := range 4 {
 			scales[s] = ue4m3ToFP32NVFP4(block[s])
 		}
 
 		// Decode 4 sub-blocks of 16 elements each
 		qs := block[4 : 4+32]
-		for s := 0; s < 4; s++ {
+		for s := range 4 {
 			scale := scales[s]
 			sub := qs[s*8 : (s+1)*8]
-			for j := 0; j < 8; j++ {
+			for j := range 8 {
 				nib0 := sub[j] & 0x0F
 				nib1 := sub[j] >> 4
 
@@ -934,21 +911,15 @@ func requantNVFP4(data []float32) ([]byte, error) {
 	numBlocks := (len(data) + blockSz - 1) / blockSz
 	out := make([]byte, numBlocks*40)
 
-	for b := 0; b < numBlocks; b++ {
+	for b := range numBlocks {
 		block := out[b*40 : (b+1)*40]
 		start := b * blockSz
-		end := start + blockSz
-		if end > len(data) {
-			end = len(data)
-		}
+		end := min(start+blockSz, len(data))
 
 		// Process 4 sub-blocks of 16 elements each
-		for s := 0; s < 4; s++ {
+		for s := range 4 {
 			sbStart := start + s*16
-			sbEnd := sbStart + 16
-			if sbEnd > end {
-				sbEnd = end
-			}
+			sbEnd := min(sbStart+16, end)
 
 			// Find optimal UE4M3 scale by trying all valid values
 			bestScale := float32(0)
@@ -971,7 +942,7 @@ func requantNVFP4(data []float32) ([]byte, error) {
 
 			// Quantize 16 elements to E2M1 nibbles
 			qsOff := 4 + s*8
-			for j := 0; j < 8; j++ {
+			for j := range 8 {
 				i0 := sbStart + j*2
 				i1 := i0 + 1
 				if i1 >= end {
@@ -1008,15 +979,15 @@ func computeNVFP4Err(vals []float32, scale float32) float64 {
 func findBestUE4M3(target float32) byte {
 	best := byte(0)
 	bestDiff := math.Inf(1)
-	for cand := uint8(0); cand < 0x80; cand++ {
-		v := ue4m3ToFP32NVFP4(cand)
+	for cand := range 0x80 {
+		v := ue4m3ToFP32NVFP4(uint8(cand))
 		if v == 0 {
 			continue
 		}
 		diff := math.Abs(float64(v - target))
 		if diff < bestDiff {
 			bestDiff = diff
-			best = cand
+			best = uint8(cand)
 		}
 	}
 	return best
@@ -1033,7 +1004,7 @@ func quantizeNVFP4Nibble(val float32) byte {
 	}
 	best := 0
 	bestDiff := math.Inf(1)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		diff := math.Abs(float64(nvfp4E2M1Pos[i]) - float64(v))
 		if diff < bestDiff {
 			bestDiff = diff
