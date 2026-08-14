@@ -207,8 +207,6 @@ dst.Close()
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `Open` | `func Open(path string) (*GGUF, error)` | Open a GGUF file by path. Auto-detects multi-shard files and combines shards into a single logical reader. |
-| `OpenForRead` | `func OpenForRead(path string) (*GGUF, error)` | Alias for `Open`. Opens a file for lazy reading. |
-| `NewReader` | `func NewReader(path string) (*GGUF, error)` | Deprecated alias for `Open`. Use `Open` instead. |
 | `(*GGUF).Metadata()` | `func (g *GGUF) Metadata() ([]*MetadataEntry, error)` | Walk the KV section and return all metadata entries. Small values are eagerly parsed; large ones remain file-backed with lazy loading on `.Value()`. |
 | `(*GGUF).Tensors()` | `func (g *GGUF) Tensors() ([]*Tensor, error)` | Walk tensor metadata section (ONE seek to kvEnd + N sequential reads) and return all tensors. |
 | `(*GGUF).Version()` | `func (g *GGUF) Version() uint32` | Return GGUF file version (always 3 after validation). |

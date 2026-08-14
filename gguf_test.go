@@ -2,10 +2,8 @@ package gguf
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"testing"
 	"time"
@@ -43,17 +41,13 @@ func TestRoundTrip(t *testing.T) {
 	}
 
 	// Read back using new API
-	f, err := os.Open(tmpFile)
+	g, err := NewReader(tmpFile)
 	if err != nil {
-		t.Fatalf("os.Open: %v", err)
+		t.Fatalf("NewReader: %v", err)
 	}
-	info, _ := f.Stat()
-	rdr, err := OpenFromReader(f, info.Size())
-	if err != nil {
-		f.Close()
-		t.Fatalf("Open: %v", err)
-	}
-	defer rdr.Close()
+	defer g.Close()
+
+	rdr := g
 
 	if rdr.Version() != Version3 {
 		t.Errorf("version = %d, want %d", rdr.Version(), Version3)
@@ -126,82 +120,6 @@ func TestConvertName(t *testing.T) {
 			t.Errorf("ConvertName(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
-}
-
-func TestF32Dequant(t *testing.T) {
-	inputs := []float32{0.0, 1.0, -1.0, 0.5, -0.5, 1.234}
-	data := make([]byte, len(inputs)*4)
-	for i, v := range inputs {
-		binary.LittleEndian.PutUint32(data[i*4:i*4+4], math.Float32bits(v))
-	}
-
-	deq, err := Dequant(data, GgmlF32)
-	if err != nil {
-		t.Fatalf("Dequant: %v", err)
-	}
-	if len(deq) != len(inputs) {
-		t.Fatalf("dequant len = %d, want %d", len(deq), len(inputs))
-	}
-	for i, v := range inputs {
-		if deq[i] != v {
-			t.Errorf("dequant[%d] = %f, want %f", i, deq[i], v)
-		}
-	}
-}
-
-func TestNVFP4Dequant(t *testing.T) {
-	inputs := []float32{
-		0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-		-0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0, 0.0,
-		0.25, 0.75, 1.25, 2.5, 3.5, 5.0, 0.0, -0.25,
-		0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-		0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-		0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-		0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-		0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-	}
-	if len(inputs) != 64 {
-		t.Fatalf("inputs len = %d, want 64", len(inputs))
-	}
-
-	requant, err := Requantize(inputs, GgmlNVFP4)
-	if err != nil {
-		t.Fatalf("Requantize: %v", err)
-	}
-	if len(requant) != 40 {
-		t.Fatalf("requant size = %d, want 40", len(requant))
-	}
-
-	deq, err := Dequant(requant, GgmlNVFP4)
-	if err != nil {
-		t.Fatalf("Dequant: %v", err)
-	}
-	if len(deq) != len(inputs) {
-		t.Fatalf("dequant len = %d, want %d", len(deq), len(inputs))
-	}
-
-	for i := range inputs {
-		if inputs[i] == 0 {
-			continue
-		}
-		got := deq[i]
-		if got == 0 {
-			if inputs[i] != 0.25 && inputs[i] != 0.75 && inputs[i] != 1.25 && inputs[i] != 2.5 && inputs[i] != 3.5 && inputs[i] != 5.0 {
-				t.Errorf("dequant[%d] = 0, want approx %f", i, inputs[i])
-			}
-		}
-	}
-
-	if GgmlNVFP4.GgmlName() != "NVFP4" {
-		t.Errorf("GgmlName = %q, want NVFP4", GgmlNVFP4.GgmlName())
-	}
-	if GgmlNVFP4.ElementsPerBlock() != 64 {
-		t.Errorf("ElementsPerBlock = %d, want 64", GgmlNVFP4.ElementsPerBlock())
-	}
-	if GgmlNVFP4.BlockBytes() != 40 {
-		t.Errorf("BlockBytes = %d, want 40", GgmlNVFP4.BlockBytes())
-	}
-	t.Logf("NVFP4: 64 elements, block=40B, name=%s", GgmlNVFP4.GgmlName())
 }
 
 // rwBuffer is a bytes.Buffer that implements io.ReadSeeker.

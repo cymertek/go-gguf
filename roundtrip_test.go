@@ -3,6 +3,7 @@ package gguf
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -78,9 +79,20 @@ func TestRoundTripFile(t *testing.T) {
 	defer f.Close()
 
 	info, _ := f.Stat()
-	rdr, err := OpenFromReader(f, info.Size())
-	if err != nil {
-		t.Fatalf("Open: %v", err)
+
+	var hdr [24]byte
+	if _, err := io.ReadFull(io.NewSectionReader(f, 0, 24), hdr[:]); err != nil {
+		f.Close()
+		t.Fatalf("read header: %v", err)
+	}
+
+	rdr := &GGUF{
+		r:         f,
+		fileSz:    info.Size(),
+		version:   binary.LittleEndian.Uint32(hdr[4:8]),
+		nTensor:   binary.LittleEndian.Uint64(hdr[8:16]),
+		nKV:       binary.LittleEndian.Uint64(hdr[16:24]),
+		alignment: defaultAlignment,
 	}
 	defer rdr.Close()
 

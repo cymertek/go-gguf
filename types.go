@@ -235,8 +235,9 @@ func (t GgmlType) BlockBytes() int {
 }
 
 // IsSupported returns true if this type has a known block layout and is supported
-// for reading and dequantization by [Dequant]. A return value of false means the
-// type constant exists but no decoder is implemented yet.
+// by [github.com/cymertek/go-quant] for dequantization. A return value of false means the
+// type constant exists but no decoder is implemented yet. Use [Tensor.Reader] to stream data
+// into go-quant's decoder for dequantization instead of loading full tensors into memory.
 func (t GgmlType) IsSupported() bool {
 	return t.BlockBytes() != 0
 }
@@ -455,10 +456,10 @@ func (s *shardHandle) readKVSection() error {
 			switch elemType {
 			case BTypeString:
 				var totalStrData uint64
-				for j := uint64(0); j < count; j++ {
+				for range int(count) {
 					slenBuf := make([]byte, 8)
 					if _, err := readFull(s.r, slenBuf, int64(pos)); err != nil {
-						return fmt.Errorf("kv[%d] array string len[%d]: %w", i, j, err)
+						return fmt.Errorf("kv[%d] array string len: %w", i, err)
 					}
 					slen := binary.LittleEndian.Uint64(slenBuf)
 					totalStrData += 8 + slen
@@ -802,10 +803,7 @@ func (mr *multiReaderAt) ReadAt(buf []byte, off int64) (int, error) {
 			break // end of all shards reached
 		}
 
-		n := int64(len(buf[totalRead:]))
-		if n > remainingInShard {
-			n = remainingInShard
-		}
+		n := min(int64(len(buf[totalRead:])), remainingInShard)
 
 		read, err := mr.shards[shardIdx].r.ReadAt(buf[totalRead:totalRead+int(n)], pos)
 		totalRead += read
@@ -1035,21 +1033,6 @@ func putBuffer(buf []byte) {
 // Multi-shard GGUF support — public API methods
 // ---------------------------------------------------------------------------
 
-// ShardIndex returns the 0-based index of this GGUF reader within its multi-shard split,
-// or -1 if this is not part of a split (single-file GGUF). Useful for displaying progress
-// when iterating over shards in order.
-func (g *GGUF) ShardIndex() int {
-	if g.splitInfo == nil || len(g.splitInfo.shards) == 0 {
-		return -1
-	}
-	for i, s := range g.splitInfo.shards {
-		if s.r == g.r {
-			return i
-		}
-	}
-	return -1
-}
-
 // IsSplit returns true when the underlying file is one shard of a multi-file split GGUF
 // (e.g., TestModel-V4). When true, [SplitInfo] will be non-nil and contains per-shard metadata.
 func (g *GGUF) IsSplit() bool {
@@ -1071,12 +1054,17 @@ func (g *GGUF) SplitInfo() *SplitInfo {
 
 	for i, s := range g.splitInfo.shards {
 		info.TensorsPerShard[i] = s.nTensor
-		// Create a proper GGUF reader for each shard by calling OpenFromReader
-		shardGGUF, err := OpenFromReader(s.r, s.fileSz)
-		if err != nil {
-			fmt.Printf("Warning: failed to open shard %d: %v\n", i+1, err)
-			continue
+
+		// Construct GGUF reader directly from shard handle (no header re-read needed)
+		shardGGUF := &GGUF{
+			r:       s.r,
+			fileSz:  s.fileSz,
+			version: s.version,
+			nTensor: s.nTensor,
+			nKV:     s.nKV,
+			alignment: defaultAlignment,
 		}
+
 		info.Shards[i] = &SplitShard{
 			Index:      i,
 			Path:       s.path,

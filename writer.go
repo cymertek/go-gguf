@@ -18,16 +18,16 @@ import (
 // [Create]. Metadata (KV pairs) are kept in memory since they are small; tensor data is
 // written sequentially at [StreamWriter.Close] time after all tensors have been queued.
 type StreamWriter struct {
-	w        io.WriterAt     // underlying writer (file, network buffer, etc.)
-	meta     *writerMeta     // accumulated KV entries (in memory — always small)
-	buf8     [8]byte         // reusable 8-byte buffer for writes
-	tensors  []tensorBuf     // queued tensors with pre-computed offsets
-	dataStart uint64         // aligned start of tensor data section
-	totalSize uint64         // total file size after all tensors written
+	w         io.WriterAt // underlying writer (file, network buffer, etc.)
+	meta      *writerMeta // accumulated KV entries (in memory — always small)
+	buf8      [8]byte     // reusable 8-byte buffer for writes
+	tensors   []tensorBuf // queued tensors with pre-computed offsets
+	dataStart uint64      // aligned start of tensor data section
+	totalSize uint64      // total file size after all tensors written
 
-	alignment    uint64
+	alignment     uint64
 	headerWritten bool
-	initialized  bool
+	initialized   bool
 }
 
 // writerMeta holds KV entries in memory for writing. Metadata is always small relative to tensors.
@@ -139,8 +139,8 @@ func (a *writerAdapter) WriteAt(p []byte, off int64) (int, error) {
 // [GGUFWriter.WriteTensorData] to queue tensors with their data, then [GGUFWriter.Close] to
 // finalize the file. GGUFWriter is NOT safe for concurrent use; serialize calls from a single goroutine.
 type GGUFWriter struct {
-	sw    *StreamWriter
-	meta  *writerMeta // alias to StreamWriter's internal meta
+	sw   *StreamWriter
+	meta *writerMeta // alias to StreamWriter's internal meta
 }
 
 // SetKV adds or replaces a key-value pair in the metadata section. If the key already exists,
@@ -217,10 +217,10 @@ func (w *GGUFWriter) Close() (int64, error) {
 // [StreamWriter.Close]. Prefer this over [Create] when you already have an io.WriterAt (e.g., a file).
 func NewStreamWriter(w io.WriterAt) *StreamWriter {
 	return &StreamWriter{
-		w:           w,
-		meta:        newWriterMeta(),
-		tensors:     make([]tensorBuf, 0, 16),
-		alignment:   defaultAlignment,
+		w:         w,
+		meta:      newWriterMeta(),
+		tensors:   make([]tensorBuf, 0, 16),
+		alignment: defaultAlignment,
 	}
 }
 
@@ -680,17 +680,17 @@ func computeKVSize(entries []KVEntry) uint64 {
 			total += 12 + uint64(len(e.Value.Raw)) // elem_type(4)+count(8)+raw data
 		default:
 			typeSizes := map[BType]int{
-				BTypeBool:         1,
-				BTypeUint8:        1,
-				BTypeInt8:         1,
-				BTypeUint16:       2,
-				BTypeInt16:        2,
-				BTypeUint32:       4,
-				BTypeInt32:        4,
-				BTypeFloat32:      4,
-				BTypeUint64:       8,
-				BTypeInt64:        8,
-				BTypeFloat64:      8,
+				BTypeBool:    1,
+				BTypeUint8:   1,
+				BTypeInt8:    1,
+				BTypeUint16:  2,
+				BTypeInt16:   2,
+				BTypeUint32:  4,
+				BTypeInt32:   4,
+				BTypeFloat32: 4,
+				BTypeUint64:  8,
+				BTypeInt64:   8,
+				BTypeFloat64: 8,
 			}
 			total += uint64(typeSizes[e.Value.BType])
 		}

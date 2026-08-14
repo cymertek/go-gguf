@@ -14,96 +14,166 @@ const defaultAlignment = uint64(32)
 // Open — reads only the 24-byte header, returns a lazy GGUF handle
 // ---------------------------------------------------------------------------
 
-// Open opens a GGUF file by path and returns a lazy [*GGUF] reader. If the file is part of
-// a multi-shard split (e.g., TestModel-V4 with files named "model-*-of-NNNNN.gguf"), it will
-// automatically detect all shards, validate header consistency across them, and combine into
-// a single logical [io.ReaderAt]. The returned *GGUF must be closed via [GGUF.Close] when done.
+// NewReader opens one or more GGUF files and returns a lazy [*GGUF] reader. For single-file
+// GGUFs pass one path; for multi-shard splits (e.g., TestModel-V4 with files named
+// "model-*-of-NNNNN.gguf"), pass all shard paths in order — the library auto-detects and validates
+// they form a consistent split. The returned *GGUF must be closed via [GGUF.Close] when done.
 //
-// Open reads only the 24-byte GGUF header immediately; KV metadata and tensor info are walked
+// NewReader reads only the 24-byte GGUF header immediately; KV metadata and tensor info are walked
 // lazily on first call to [GGUF.Metadata] or [GGUF.Tensors].
 //
-// Example:
+// Example — single file:
 //
-//	g, err := gguf.Open("model.gguf")
+//	g, err := gguf.NewReader("model.gguf")
 //	if err != nil { log.Fatal(err) }
 //	defer g.Close()
-//	fmt.Printf("Version=%d Tensors=%d KV=%d\n", g.Version(), g.NumTensors(), len(g.Metadata()))
-func Open(path string) (*GGUF, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("gguf: open %q: %w", path, err)
+//
+// Example — multi-shard split (files passed in order):
+//
+//	g, err := gguf.NewReader(
+//	    "shard-00001-of-00003.gguf",
+//	    "shard-00002-of-00003.gguf",
+//	    "shard-00003-of-00003.gguf",
+//	)
+func NewReader(files ...string) (*GGUF, error) {
+	if len(files) == 0 {
+		return nil, fmt.Errorf("gguf: no files provided")
 	}
 
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, fmt.Errorf("gguf: stat %q: %w", path, err)
+	g := &GGUF{
+		version:   Version3, // placeholder; validated per shard below
+		nTensor:   1,        // placeholder; summed across shards below
+		nKV:       0,        // placeholder; summed across shards below
+		alignment: defaultAlignment,
 	}
 
-	g, err := OpenFromReader(f, info.Size())
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	g.sourcePath = path
+	if len(files) == 1 {
+		// Single file — open and validate header
+		f, err := os.Open(files[0])
+		if err != nil {
+			return nil, fmt.Errorf("gguf: open %q: %w", files[0], err)
+		}
 
-	// Check if this is a split file and combine shards
-	splitInfo, err := g.detectSplit(path)
-	if err != nil {
-		return nil, fmt.Errorf("gguf: detect split: %w", err)
+		info, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("gguf: stat %q: %w", files[0], err)
+		}
+
+		var hdr [24]byte
+		if _, err := io.ReadFull(io.NewSectionReader(f, 0, 24), hdr[:]); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("gguf: read header for %q: %w", files[0], err)
+		}
+
+		if string(hdr[0:4]) != Magic {
+			f.Close()
+			return nil, fmt.Errorf("gguf: invalid magic in %q", files[0])
+		}
+
+		version := binary.LittleEndian.Uint32(hdr[4:8])
+		if version < Version1 || version > Version3 {
+			f.Close()
+			return nil, fmt.Errorf("gguf: unsupported version %d in %q", version, files[0])
+		}
+
+		g.r = f
+		g.fileSz = info.Size()
+		g.sourcePath = files[0]
+		g.version = version
+		g.nTensor = binary.LittleEndian.Uint64(hdr[8:16])
+		g.nKV = binary.LittleEndian.Uint64(hdr[16:24])
+
+		// Check if this is a split file and auto-detect other shards
+		splitInfo, err := g.detectSplit(files[0])
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("gguf: detect split: %w", err)
+		}
+
+		if splitInfo != nil && len(splitInfo.shards) > 1 {
+			g.splitInfo = splitInfo
+		}
+
+		return g, nil
 	}
 
-	if splitInfo != nil && len(splitInfo.shards) > 1 {
-		g.splitInfo = splitInfo
+	// Multi-file — validate all headers match and combine into multiReaderAt
+	shards := make([]*shardHandle, len(files))
+	var totalTensors uint64
+	var totalKV uint64
+
+	for i, path := range files {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("gguf: open %q (shard %d): %w", path, i+1, err)
+		}
+
+		info, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return nil, fmt.Errorf("gguf: stat %q: %w", path, err)
+		}
+
+		var hdr [24]byte
+		if _, err := io.ReadFull(io.NewSectionReader(f, 0, 24), hdr[:]); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("gguf: read header for %q (shard %d): %w", path, i+1, err)
+		}
+
+		if string(hdr[0:4]) != Magic {
+			f.Close()
+			return nil, fmt.Errorf("gguf: invalid magic in %q (shard %d)", path, i+1)
+		}
+
+		version := binary.LittleEndian.Uint32(hdr[4:8])
+		if version < Version1 || version > Version3 {
+			f.Close()
+			return nil, fmt.Errorf("gguf: unsupported version %d in %q (shard %d)", version, path, i+1)
+		}
+
+		nTensor := binary.LittleEndian.Uint64(hdr[8:16])
+		nKV := binary.LittleEndian.Uint64(hdr[16:24])
+
+		shards[i] = &shardHandle{
+			r:       f,
+			fileSz:  info.Size(),
+			version: version,
+			nKV:     nKV,
+			nTensor: nTensor,
+			path:    path,
+			index:   i,
+		}
+
+		totalTensors += nTensor
+		totalKV += nKV
 	}
+
+	g.r = &multiReaderAt{shards: shards}
+	g.fileSz = 0 // computed by multiReaderAt
+	g.version = shards[0].version
+	g.nTensor = totalTensors
+	g.nKV = totalKV
 
 	return g, nil
 }
 
-// OpenFromReader opens a GGUF file from any [io.ReaderAt] (e.g., *os.File, S3 range reader,
-// gzip decompressor) and returns a lazy [*GGUF]. The caller must provide the exact total file
-// size via fileSz. This is useful for testing with in-memory buffers or for reading over
-// network protocols that implement ReaderAt semantics.
+// Open opens a GGUF file by path and returns a lazy [*GGUF] reader. For single-file GGUFs it is
+// equivalent to [NewReader]; for multi-shard splits with files named like "model-*-of-NNNNN.gguf",
+// pass any one shard and the library auto-detects and combines all matching shards in order.
+// The returned *GGUF must be closed via [GGUF.Close] when done.
 //
-// Example:
+// Example — single file:
 //
-//	data := readFile("model.gguf")
-//	g, err := gguf.OpenFromReader(bytes.NewReader(data), int64(len(data)))
+//	g, err := gguf.Open("model.gguf")
 //	if err != nil { log.Fatal(err) }
 //	defer g.Close()
-func OpenFromReader(r io.ReaderAt, fileSz int64) (*GGUF, error) {
-	if fileSz < 24 {
-		return nil, fmt.Errorf("gguf: file size %d too small for header", fileSz)
-	}
-
-	var hdr [24]byte
-	if _, err := io.ReadFull(io.NewSectionReader(r, 0, 24), hdr[:]); err != nil {
-		return nil, fmt.Errorf("gguf: read header: %w", err)
-	}
-
-	// Validate magic
-	if string(hdr[0:4]) != Magic {
-		return nil, fmt.Errorf("gguf: invalid magic %q, want %q", hdr[0:4], Magic)
-	}
-
-	version := binary.LittleEndian.Uint32(hdr[4:8])
-	if version < Version1 || version > Version3 {
-		return nil, fmt.Errorf("gguf: unsupported version %d (only v1–v3 supported)", version)
-	}
-
-	nTensor := binary.LittleEndian.Uint64(hdr[8:16])
-	nKV := binary.LittleEndian.Uint64(hdr[16:24])
-
-	g := &GGUF{
-		r:       r,
-		fileSz:  fileSz,
-		version: version,
-		nTensor: nTensor,
-		nKV:     nKV,
-		alignment: defaultAlignment,
-	}
-
-	return g, nil
+//
+// Example — multi-shard (pass any shard; library finds the rest):
+//
+//	g, err := gguf.Open("shard-00002-of-00003.gguf") // auto-combines all 3 shards
+func Open(path string) (*GGUF, error) {
+	return NewReader(path)
 }
 
 // Close releases the GGUF reader. If the underlying [io.ReaderAt] also implements io.Closer
@@ -126,29 +196,6 @@ func (g *GGUF) Version() uint32 { return g.version }
 // zero-allocation query that does not walk the tensor metadata section -- actual [Tensor]
 // handles are only constructed when [GGUF.Tensors] or related methods are called.
 func (g *GGUF) NumTensors() int { return int(g.nTensor) }
-
-// OpenForRead opens a GGUF file by path for lazy reading. It is an alias for [Open] with the
-// same semantics -- reads only the 24-byte header immediately and walks KV/tensor sections lazily.
-// Prefer [Open] for new code; this name exists for backwards compatibility.
-func OpenForRead(path string) (*GGUF, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, fmt.Errorf("gguf: open %q: %w", path, err)
-	}
-
-	info, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, fmt.Errorf("gguf: stat %q: %w", path, err)
-	}
-
-	g, err := OpenFromReader(f, info.Size())
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	return g, nil
-}
 
 // ---------------------------------------------------------------------------
 // walkKVSection — lazy KV metadata walk with per-entry value caching
@@ -513,7 +560,7 @@ func (g *GGUF) walkTensorSection() error {
 
 		// Read dimensions (shapeLen × uint64)
 		dims := make([]uint64, shapeLen)
-		for d := uint32(0); d < shapeLen; d++ {
+		for d := range int(shapeLen) {
 			dimBuf := make([]byte, 8)
 			if _, err := readFull(g.r, dimBuf, pos); err != nil {
 				return fmt.Errorf("gguf: tensor[%d] dim %d: %w", i, d, err)
@@ -681,23 +728,8 @@ func readFull(r io.ReaderAt, buf []byte, off int64) (int, error) {
 }
 
 // ---------------------------------------------------------------------------
-// Dequant convenience method on Tensor
+// Tensor streaming read methods
 // ---------------------------------------------------------------------------
-
-// Dequant reads the entire raw tensor data from file via streaming (no full allocation to []byte),
-// then calls [Dequant] to convert it into a []float32 slice of de-quantized values. For large tensors
-// this still allocates memory for the float slice; prefer reading chunks via [Tensor.ReadAt] or
-// [Tensor.Reader] with streaming dequantization for memory-constrained applications. The returned
-// slice must not be modified by the caller.
-func (t *Tensor) Dequant() ([]float32, error) {
-	r := t.Reader()
-	data := make([]byte, t.info.NBytes)
-	n, err := io.ReadFull(r, data)
-	if err != nil || n == 0 {
-		return nil, fmt.Errorf("gguf: read tensor %s for dequant: %w", t.info.Name, err)
-	}
-	return Dequant(data[:n], t.info.GgmlType)
-}
 
 // Read reads up to len(dst) bytes from the tensor's raw data starting at offset 0. This is a
 // convenience wrapper around [Tensor.ReadAt] that returns an [io.Reader]-style interface for use in
@@ -750,10 +782,7 @@ func (t *tensorReaderAt) ReadAt(buf []byte, off int64) (int, error) {
 		return 0, io.EOF
 	}
 	avail := t.n - off
-	n := len(buf)
-	if n > int(avail) {
-		n = int(avail)
-	}
+	n := min(len(buf), int(avail))
 	data := buf[:n]
 	read, err := t.r.ReadAt(data, t.off+off)
 	return read, err

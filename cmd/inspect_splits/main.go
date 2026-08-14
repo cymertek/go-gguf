@@ -13,14 +13,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	f, err := os.Open(os.Args[1])
+	rdr, err := gguf.NewReader(os.Args[1])
 	if err != nil {
 		panic(err)
 	}
-	defer f.Close()
-
-	info, _ := f.Stat()
-	rdr, err := gguf.OpenFromReader(f, info.Size())
+	defer rdr.Close()
 	if err != nil {
 		panic(err)
 	}
