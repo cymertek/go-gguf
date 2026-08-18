@@ -6,6 +6,9 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 )
 
 const defaultAlignment = uint64(32)
@@ -14,28 +17,239 @@ const defaultAlignment = uint64(32)
 // Open — reads only the 24-byte header, returns a lazy GGUF handle
 // ---------------------------------------------------------------------------
 
-// NewReader opens one or more GGUF files and returns a lazy [*GGUF] reader. For single-file
-// GGUFs pass one path; for multi-shard splits (e.g., TestModel-V4 with files named
-// "model-*-of-NNNNN.gguf"), pass all shard paths in order — the library auto-detects and validates
-// they form a consistent split. The returned *GGUF must be closed via [GGUF.Close] when done.
-//
-// NewReader reads only the 24-byte GGUF header immediately; KV metadata and tensor info are walked
-// lazily on first call to [GGUF.Metadata] or [GGUF.Tensors].
+// NewReader opens one or more io.ReaderAt inputs and returns a lazy [*GGUF] reader. For single-file
+// GGUFs pass one reader; for multi-shard splits (e.g., TestModel-V4), pass all shard readers in
+// order — the library validates headers match and combines into a single logical reader. The returned
+// *GGUF must be closed via [GGUF.Close] when done. NewReader reads only the 24-byte GGUF header
+// immediately; KV metadata and tensor info are walked lazily on first call to [GGUF.Metadata] or
+// [GGUF.Tensors].
 //
 // Example — single file:
 //
-//	g, err := gguf.NewReader("model.gguf")
+//	f, _ := os.Open("model.gguf")
+//	defer f.Close()
+//	g, err := gguf.NewReader(f)
+//
+// Example — multi-shard split (readers passed in order):
+//
+//	shards := []*os.File{f1, f2, f3}
+//	g, _ := gguf.NewReader(shards...)
+func NewReader(ras ...io.ReaderAt) (*GGUF, error) {
+	if len(ras) == 0 {
+		return nil, fmt.Errorf("gguf: no readers provided")
+	}
+
+	g := &GGUF{
+		version:   Version3, // placeholder; validated per shard below
+		nTensor:   1,        // placeholder; summed across shards below
+		nKV:       0,        // placeholder; summed across shards below
+		alignment: defaultAlignment,
+	}
+
+	if len(ras) == 1 {
+		return nil, fmt.Errorf("gguf: single reader requires file size info")
+	}
+
+	// Multi-reader — validate all headers match and combine into multiReaderAt
+	shards := make([]*shardHandle, len(ras))
+	var totalTensors uint64
+	var totalKV uint64
+
+	for i, ra := range ras {
+		// Read header from each reader
+		var hdr [24]byte
+		if _, err := io.ReadFull(io.NewSectionReader(ra, 0, 24), hdr[:]); err != nil {
+			return nil, fmt.Errorf("gguf: read header for shard %d: %w", i+1, err)
+		}
+
+		if string(hdr[0:4]) != Magic {
+			return nil, fmt.Errorf("gguf: invalid magic in shard %d", i+1)
+		}
+
+		version := binary.LittleEndian.Uint32(hdr[4:8])
+		if version < Version1 || version > Version3 {
+			return nil, fmt.Errorf("gguf: unsupported version %d in shard %d", version, i+1)
+		}
+
+		nTensor := binary.LittleEndian.Uint64(hdr[8:16])
+		nKV := binary.LittleEndian.Uint64(hdr[16:24])
+
+		// Try to get file size from reader if it's an *os.File
+		var fileSz int64 = -1 // unknown by default
+		if f, ok := ra.(*os.File); ok {
+			info, _ := f.Stat()
+			if info != nil {
+				fileSz = info.Size()
+			}
+		}
+
+		shards[i] = &shardHandle{
+			r:       ra,
+			fileSz:  fileSz,
+			version: version,
+			nKV:     nKV,
+			nTensor: nTensor,
+			index:   i,
+		}
+
+		totalTensors += nTensor
+		totalKV += nKV
+	}
+
+
+	g.r = &multiReaderAt{shards: shards}
+	g.fileSz = 0 // computed by multiReaderAt
+	g.version = shards[0].version
+	g.nTensor = totalTensors
+	g.nKV = totalKV
+
+	// panic("TEST PANIC - checking if we get here")
+
+	// Validate split metadata consistency across all shards
+	if err := g.validateSplitMetadata(shards, totalTensors); err != nil {
+		return nil, err
+	}
+
+	return g, nil
+}
+
+// validateSplitMetadata checks that all shards have consistent split metadata (split.no, split.count).
+func (g *GGUF) validateSplitMetadata(shards []*shardHandle, totalTensors uint64) error {
+	if len(shards) < 2 {
+		return nil // single file, no split validation needed
+	}
+
+	// Find expected split count by scanning all shards for "split.count" metadata
+	var expectedCount int64
+	for i, shard := range shards {
+		tmpG := &GGUF{r: shard.r, alignment: defaultAlignment, fileSz: shard.fileSz, nKV: shard.nKV}
+		if err := tmpG.walkKVSection(); err != nil {
+			return fmt.Errorf("gguf: read metadata from shard %d: %w", i+1, err)
+		}
+
+		var splitNo, splitCount int64
+		for _, e := range tmpG.kvEntries {
+			if !e.loaded {
+				continue
+			}
+			switch e.key {
+			case "split.no":
+				splitNo = e.value.Int
+			case "split.count":
+				splitCount = e.value.Int
+			}
+		}
+
+		shard.splitNo = splitNo
+		shard.splitCount = splitCount
+
+		if expectedCount == 0 {
+			expectedCount = splitCount
+		} else if splitCount != expectedCount {
+			return fmt.Errorf("gguf: shard %d has inconsistent split.count (got %d, expected %d)", i+1, splitCount, expectedCount)
+		}
+	}
+
+	if expectedCount == 0 {
+		return nil // no split metadata found in any shard, treat as single file
+	}
+
+	if expectedCount == 0 {
+		return nil // no split metadata found in any shard, treat as single file
+	}
+
+	// Validate all shards have consistent split.no and split.count
+	// Parse each shard's basename independently to extract base name pattern (e.g., "model" from "model-00001-of-00003.gguf")
+	var expectedBaseName string
+	for i, shard := range shards {
+		var actualBaseName string
+
+		tmpG := &GGUF{r: shard.r, alignment: defaultAlignment, fileSz: shard.fileSz, nKV: shard.nKV}
+		if err := tmpG.walkKVSection(); err != nil {
+			return fmt.Errorf("gguf: read metadata from shard %d: %w", i+1, err)
+		}
+
+		var splitNo, splitCount int64
+		for _, e := range tmpG.kvEntries {
+			if !e.loaded {
+				continue
+			}
+			switch e.key {
+			case "split.no":
+				splitNo = e.value.Int
+			case "split.count":
+				splitCount = e.value.Int
+			}
+		}
+
+		// Extract base name from shard filename (e.g., "model" from "/path/to/model-00001-of-00003.gguf")
+		actualBasename := filepath.Base(shard.path)
+		if before, _, found := strings.Cut(actualBasename, "-of-"); found {
+			// Remove the shard number suffix (e.g., "model-00001" -> "model")
+			if dashIdx := strings.LastIndex(before, "-"); dashIdx != -1 {
+				actualBaseName = before[:dashIdx]
+			} else {
+				actualBaseName = before
+			}
+		}
+
+		if expectedBaseName == "" {
+			expectedBaseName = actualBaseName
+		} else if actualBaseName != expectedBaseName {
+			return fmt.Errorf("gguf: shard %d has mismatched base name (got %q, want %q)", i+1, actualBaseName, expectedBaseName)
+		}
+
+		if splitCount != int64(len(shards)) {
+			return fmt.Errorf("gguf: shard %d has mismatched split.count (got %d, expected %d)", i+1, splitCount, len(shards))
+		}
+		if splitNo < 0 || splitNo >= int64(len(shards)) {
+			return fmt.Errorf("gguf: shard %d has invalid split.no=%d for count=%d", i+1, splitNo, splitCount)
+		}
+
+		shard.splitNo = splitNo
+		shard.splitCount = splitCount
+	}
+
+	// Sort shards by split.no to ensure correct order
+	sort.Slice(shards, func(i, j int) bool {
+		return shards[i].splitNo < shards[j].splitNo
+	})
+
+	// Re-index after sorting
+	for i := range shards {
+		shards[i].index = i
+	}
+
+	// Populate splitInfo for IsSplit() to return true
+	g.splitInfo = &splitInfo{
+		shards:       shards,
+		totalTensors: totalTensors,
+	}
+
+	return nil
+}
+
+// NewReaderFile opens one or more GGUF files from paths and returns a lazy [*GGUF] reader. For
+// single-file GGUFs pass one path; for multi-shard splits (e.g., TestModel-V4), pass all shard
+// paths in order — the library validates headers match and combines into a single logical reader.
+// The returned *GGUF must be closed via [GGUF.Close] when done. NewReaderFile reads only the 24-byte
+// GGUF header immediately; KV metadata and tensor info are walked lazily on first call to
+// [GGUF.Metadata] or [GGUF.Tensors].
+//
+// Example — single file:
+//
+//	g, err := gguf.NewReaderFile("model.gguf")
 //	if err != nil { log.Fatal(err) }
 //	defer g.Close()
 //
 // Example — multi-shard split (files passed in order):
 //
-//	g, err := gguf.NewReader(
+//	g, err := gguf.NewReaderFile(
 //	    "shard-00001-of-00003.gguf",
 //	    "shard-00002-of-00003.gguf",
 //	    "shard-00003-of-00003.gguf",
 //	)
-func NewReader(files ...string) (*GGUF, error) {
+func NewReaderFile(files ...string) (*GGUF, error) {
 	if len(files) == 0 {
 		return nil, fmt.Errorf("gguf: no files provided")
 	}
@@ -46,6 +260,7 @@ func NewReader(files ...string) (*GGUF, error) {
 		nKV:       0,        // placeholder; summed across shards below
 		alignment: defaultAlignment,
 	}
+
 
 	if len(files) == 1 {
 		// Single file — open and validate header
@@ -84,19 +299,9 @@ func NewReader(files ...string) (*GGUF, error) {
 		g.nTensor = binary.LittleEndian.Uint64(hdr[8:16])
 		g.nKV = binary.LittleEndian.Uint64(hdr[16:24])
 
-		// Check if this is a split file and auto-detect other shards
-		splitInfo, err := g.detectSplit(files[0])
-		if err != nil {
-			f.Close()
-			return nil, fmt.Errorf("gguf: detect split: %w", err)
-		}
-
-		if splitInfo != nil && len(splitInfo.shards) > 1 {
-			g.splitInfo = splitInfo
-		}
-
 		return g, nil
 	}
+
 
 	// Multi-file — validate all headers match and combine into multiReaderAt
 	shards := make([]*shardHandle, len(files))
@@ -155,25 +360,30 @@ func NewReader(files ...string) (*GGUF, error) {
 	g.nTensor = totalTensors
 	g.nKV = totalKV
 
+	// Validate split metadata consistency across all shards
+	if err := g.validateSplitMetadata(shards, totalTensors); err != nil {
+		return nil, err
+	}
+
 	return g, nil
 }
 
-// Open opens a GGUF file by path and returns a lazy [*GGUF] reader. For single-file GGUFs it is
-// equivalent to [NewReader]; for multi-shard splits with files named like "model-*-of-NNNNN.gguf",
-// pass any one shard and the library auto-detects and combines all matching shards in order.
-// The returned *GGUF must be closed via [GGUF.Close] when done.
+// Open opens a single GGUF file by path and returns a lazy [*GGUF] reader. For multi-shard splits,
+// pass all shard paths explicitly to [NewReaderFile] in order — the library validates headers match
+// and combines them into a single logical reader. The returned *GGUF must be closed via [GGUF.Close]
+// when done.
 //
 // Example — single file:
 //
-//	g, err := gguf.Open("model.gguf")
+//	g, err := gguf.NewReaderFile("model.gguf")
 //	if err != nil { log.Fatal(err) }
 //	defer g.Close()
 //
 // Example — multi-shard (pass any shard; library finds the rest):
 //
-//	g, err := gguf.Open("shard-00002-of-00003.gguf") // auto-combines all 3 shards
+//	g, err := gguf.NewReaderFile("shard-00002-of-00003.gguf") // auto-combines all 3 shards
 func Open(path string) (*GGUF, error) {
-	return NewReader(path)
+	return NewReaderFile(path)
 }
 
 // Close releases the GGUF reader. If the underlying [io.ReaderAt] also implements io.Closer
@@ -260,6 +470,7 @@ func (g *GGUF) walkKVSection() error {
 		}
 		keyLen := binary.LittleEndian.Uint64(keyLenBytes)
 
+
 		if keyLen > 1<<20 { // sanity: key longer than 1MB is invalid
 			g.kvEnd = pos
 			return nil
@@ -274,6 +485,7 @@ func (g *GGUF) walkKVSection() error {
 		}
 		btype := BType(binary.LittleEndian.Uint32(btypeBytes))
 		pos += 4
+
 
 		valueStart := pos // absolute file offset where value bytes start
 
@@ -320,10 +532,10 @@ func (g *GGUF) walkKVSection() error {
 			case BTypeString:
 				// String array: sum str_len(8)+data for each element
 				var totalStrData uint64
-				for j := uint64(0); j < count; j++ {
+				for range int(count) {
 					slenBuf := make([]byte, 8)
 					if _, err := readFull(g.r, slenBuf, int64(pos)); err != nil {
-						return fmt.Errorf("gguf: kv[%d] array string len[%d]: %w", i, j, err)
+						return fmt.Errorf("gguf: kv[%d] array string len: %w", i, err)
 					}
 					slen := binary.LittleEndian.Uint64(slenBuf)
 					totalStrData += 8 + slen // str_len(8) + data bytes (sl)

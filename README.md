@@ -1,12 +1,11 @@
 # go-gguf
 
-A pure Go library for reading and writing [GGUF](https://github.com/ggerganov/ggml/blob/master/docs/format.gguf.md) files, the binary format used by llama.cpp for model weights and metadata.
+A pure Go library for reading and writing [GGUF](https://github.com/ggerganov/ggml/blob/master/docs/gguf.md) files, the binary format used by llama.cpp for model weights and metadata.
 
 **Features:**
 - Lazy loading — only reads file headers initially (~56 bytes per file), walks KV/tensor sections on demand
 - Multi-shard support — automatically detects and combines split GGUF files
-- Zero-copy streaming — direct reader-to-writer transfers with optional filtering, transformation, and requantization
-- Buffer pooling — tiered sync.Pool for efficient memory reuse across files and tensors
+- Streaming tensor access via `io.ReadSeeker`/`io.ReaderAt` for external library consumption (e.g., go-quant)
 
 ```bash
 go get github.com/cymertek/go-gguf
@@ -25,7 +24,7 @@ import (
 )
 
 func main() {
-    g, err := gguf.Open("model.gguf")
+    g, err := gguf.NewReaderFile("model.gguf")
     if err != nil {
         panic(err)
     }
@@ -34,7 +33,7 @@ func main() {
     fmt.Printf("Version: %d\n", g.Version())
     fmt.Printf("Tensors: %d\n", g.NumTensors())
 
-    // Read metadata
+    // Read metadata (lazy walk with eager threshold ≤64B)
     meta, _ := g.Metadata()
     for _, entry := range meta {
         v, _ := entry.Value()
@@ -43,7 +42,7 @@ func main() {
         }
     }
 
-    // Read tensors
+    // Read tensors (ONE seek to kvEnd + sequential read of all entries)
     tensors, _ := g.Tensors()
     for _, t := range tensors {
         info := t.Info()
@@ -55,44 +54,55 @@ func main() {
 
 ### Reading Multi-Shard GGUF Files
 
+Pass all shard paths explicitly to `NewReaderFile` in order — the library validates headers match and combines into a single logical reader. Shards can be from different directories or mounts:
+
 ```go
-// Open any shard file — the library auto-detects and combines all shards
-g, err := gguf.Open("model-00001-of-00003.gguf")
-if err != nil {
-    panic(err)
-}
+// Example 1: All shards in same directory
+g, err := gguf.NewReaderFile(
+    "shard-00001-of-00003.gguf",
+    "shard-00002-of-00003.gguf",
+    "shard-00003-of-00003.gguf",
+)
+
+// Example 2: Shards from different directories/mounts
+g, err = gguf.NewReaderFile(
+    "/mnt/data1/shard-00001-of-00003.gguf",
+    "/mnt/data2/shard-00002-of-00003.gguf",
+    "/mnt/data3/shard-00003-of-00003.gguf",
+)
+
+if err != nil { panic(err) }
 defer g.Close()
 
 if g.IsSplit() {
     info := g.SplitInfo()
     
-    fmt.Printf("Multi-shard: %d shards, total tensors: %d\n", 
-        info.Count, sum(info.TensorsPerShard))
+    fmt.Printf("Multi-shard: %d shards\n", info.Count)
     
-    // Read metadata from shard 0 (metadata-only)
+    // Read metadata from first shard (typically the metadata-only shard)
     meta, _ := info.Shards[0].GetMetadata()
-    for _, entry := range meta[:5] { // Show first 5 entries
+    for _, entry := range meta[:5] {
         fmt.Printf("  %s = %v\n", entry.Name(), entry.Value())
     }
     
-    // Read tensors from each shard
+    // Read tensors from each shard independently
     totalTensors := 0
-    for i, shard := range info.Shards[1:] { // Skip metadata shard
+    for i, shard := range info.Shards[1:] {
         tensors, _ := shard.Tensors()
         fmt.Printf("Shard %d: %d tensors\n", i+2, len(tensors))
         totalTensors += len(tensors)
     }
-} else {
-    // Single file — use g.Metadata() and g.Tensors() directly
 }
 
-func sum(s []uint64) uint64 {
-    var n uint64
-    for _, v := range s {
-        n += v
-    }
-    return n
-}
+// Alternative: pass io.ReaderAt inputs directly (for S3 ranges, network streams, etc.)
+f1, _ := os.Open("shard-00001-of-00003.gguf")
+defer f1.Close()
+f2, _ := os.Open("shard-00002-of-00003.gguf")
+defer f2.Close()
+f3, _ := os.Open("shard-00003-of-00003.gguf")
+defer f3.Close()
+
+g, err := gguf.NewReader(f1, f2, f3)
 ```
 
 #### Custom Shard Distribution Control
@@ -135,42 +145,47 @@ writeShard("shard-00002-of-00002.gguf", nil, shard2Tensors) // No metadata in da
 
 ### Writing a GGUF File
 
+Wrap any `io.Writer` (file, gzip stream, network buffer) with `Create`:
+
 ```go
-// Create a writer
-w, err := gguf.OpenForWrite("output.gguf")
-if err != nil {
-    panic(err)
-}
+f, _ := os.Create("output.gguf")
+defer f.Close()
+w := gguf.Create(f) // Accepts io.Writer or io.WriterAt
 
 // Add metadata
 w.SetKV("general.architecture", gguf.Value{Str: "llama", BType: gguf.BTypeString})
 w.SetKV("llama.context_length", gguf.Value{Int: 2048, BType: gguf.BTypeUint32})
 
-// Add tensors
+// Add tensors — data is deferred until Close() so RAM usage stays O(1) per tensor
 shape := []uint64{512, 32000}
 data := makeTestData(512 * 32000 * 4) // F32 = 4 bytes per element
 
 idx := w.AddTensor("tok_embeddings.weight", shape, gguf.GgmlF32)
 w.WriteTensorData(idx, bytes.NewReader(data))
 
-// Close to finalize (writes header + metadata + tensors)
+// Close flushes header + metadata + tensors to disk (streams deferred readers through pooled buffer)
 written, _ := w.Close()
 fmt.Printf("Wrote %d bytes\n", written)
+```
+
+For direct file paths, use `OpenForWrite` which manages the file handle internally:
+
+```go
+w, err := gguf.OpenForWrite("output.gguf")
+if err != nil { panic(err) }
+defer w.Close() // Also closes underlying file
 ```
 
 ### Streaming Between Files (Zero-Copy)
 
 ```go
-// Copy all tensors from src to dst with filtering
+// Copy tensors from src to dst with filtering — passthrough path uses deferred streaming
 src, _ := gguf.Open("input.gguf")
-dst, _ := gguf.OpenForWrite("output.gguf")
+defer src.Close()
 
-// Set metadata
-meta, _ := src.Metadata()
-for _, entry := range meta {
-    v, _ := entry.Value()
-    dst.SetKV(entry.Name(), v)
-}
+f, _ := os.Create("output.gguf")
+defer f.Close()
+dst := gguf.Create(f)
 
 // Stream tensors (include only weight tensors, exclude bias)
 err := gguf.StreamCopy(dst, src, gguf.StreamOptions{
@@ -178,27 +193,25 @@ err := gguf.StreamCopy(dst, src, gguf.StreamOptions{
     Exclude: []string{"*bias*"},
 })
 
-dst.Close()
+dst.Close() // Flushes all deferred tensor data to disk
 ```
 
-### Requantizing Tensors
+### Transforming Tensors (In-Memory)
+
+For transformations that require full tensor data in memory, use the `Transform` callback:
 
 ```go
-// Convert from Q4_0 to F32
-src, _ := gguf.Open("model.gguf")
-dst, _ := gguf.OpenForWrite("model-f32.gguf")
-
-// Copy metadata (architecture, etc.)
-meta, _ := src.Metadata()
-for _, entry := range meta {
-    v, _ := entry.Value()
-    dst.SetKV(entry.Name(), v)
-}
-
-// Stream with requantization to F32
-err := gguf.StreamRequantize(dst, src, gguf.GgmlF32)
-dst.Close()
+// Custom transform — e.g., apply a scaling function to F32 tensors
+err := gguf.StreamCopy(dst, src, gguf.StreamOptions{
+    Include: []string{"*.weight"},
+    Transform: func(data []byte, info gguf.TensorInfo) ([]byte, error) {
+        // Process data in-place (e.g., apply quantization via go-quant library)
+        return data, nil
+    },
+})
 ```
+
+**Note:** Dequantization and requantization are handled by external libraries like [go-quant](https://github.com/cymertek/go-quant). The Transform callback receives raw tensor bytes — pass them to your quantizer of choice.
 
 ## API Reference
 
@@ -206,16 +219,15 @@ dst.Close()
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `Open` | `func Open(path string) (*GGUF, error)` | Open a GGUF file by path. Auto-detects multi-shard files and combines shards into a single logical reader. |
+| `NewReader` | `func NewReader(ras ...io.ReaderAt) (*GGUF, error)` | Open one or more io.ReaderAt inputs. Single-file: pass one reader (e.g., *os.File). Multi-shard: pass all shard readers in order; library validates headers match and combines into a single logical reader. |
+| `NewReaderFile` | `func NewReaderFile(files ...string) (*GGUF, error)` | Open GGUF files from paths. Single-file: pass one path. Multi-shard: pass all shard paths in order — shards can be from different directories/mounts; library validates naming convention and metadata consistency. |
+| `Open` | `func Open(path string) (*GGUF, error)` | Convenience alias for `NewReaderFile(path)` — auto-detects multi-shard files by filename pattern (e.g., `model-*-of-NNNNN.gguf`). |
 | `(*GGUF).Metadata()` | `func (g *GGUF) Metadata() ([]*MetadataEntry, error)` | Walk the KV section and return all metadata entries. Small values are eagerly parsed; large ones remain file-backed with lazy loading on `.Value()`. |
 | `(*GGUF).Tensors()` | `func (g *GGUF) Tensors() ([]*Tensor, error)` | Walk tensor metadata section (ONE seek to kvEnd + N sequential reads) and return all tensors. |
 | `(*GGUF).Version()` | `func (g *GGUF) Version() uint32` | Return GGUF file version (always 3 after validation). |
 | `(*GGUF).NumTensors()` | `func (g *GGUF) NumTensors() int` | Return number of tensors from header. |
 | `(*GGUF).IsSplit()` | `func (g *GGUF) IsSplit() bool` | Return true if this file is part of a multi-shard split. |
 | `(*GGUF).SplitInfo()` | `func (g *GGUF) SplitInfo() *SplitInfo` | Return information about the split shards, or nil if not a split file. |
-| `(*GGUF).ShardIndex()` | `func (g *GGUF) ShardIndex() int` | Return 0-based index of this GGUF in the split (or -1 for single-file). |
-| `(*GGUF).FindTensor()` | `func (g *GGUF) FindTensor(name string) (*Tensor, error)` | Find a tensor by name and return its handle. |
-| `(*GGUF).DataForTensor()` | `func (g *GGUF) DataForTensor(name string) ([]byte, error)` | Find a tensor by name and read all its data into memory. |
 
 ### Tensor Reading
 
@@ -223,21 +235,19 @@ dst.Close()
 |----------|-----------|-------------|
 | `(*Tensor).Info()` | `func (t *Tensor) Info() TensorInfo` | Return tensor metadata as a safe copy with copied slices. Access `.NBytes` for size in bytes, `.Shape` for dimensions, etc. Modifications to the returned struct won't affect the original tensor. |
 | `(*Tensor).ReadAt()` | `func (t *Tensor) ReadAt(dst []byte, off int64) (int, error)` | Read bytes from this tensor at the given offset. Uses per-tensor cache to avoid disk I/O for repeated reads. |
-| `(*Tensor).Bytes()` | `func (t *Tensor) Bytes() ([]byte, error)` | Read entire tensor data into a newly allocated slice. |
-| `(*Tensor).Data()` | `func (t *Tensor) Data() (io.ReaderAt, error)` | Return an io.ReaderAt positioned at this tensor's raw data in the file. |
-| `(*Tensor).Dequant()` | `func (t *Tensor) Dequant() ([]float32, error)` | Read and dequantize the entire tensor to float32 values. |
-| `(*Tensor).Close()` | `func (t *Tensor) Close()` | Release per-tensor read cache buffer back to pool. |
+| `(*Tensor).Reader()` | `func (t *Tensor) Reader() io.ReadSeeker` | Return a limited io.ReadSeeker over this tensor's raw data. Ideal for streaming to external libraries like [go-quant](https://github.com/cymertek/go-quant) — no full allocation, works with tensors larger than RAM. |
+| `(*Tensor).Data()` | `func (t *Tensor) Data() (io.ReaderAt, error)` | Return an io.ReaderAt positioned at this tensor's raw data in the file. Fixed length = NBytes. Useful for random-access reads without cache. |
 
 ### Writing
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `Create` | `func Create(w io.Writer) *GGUFWriter` | Create a new GGUF writer wrapping any io.Writer (file, gzip stream, network buffer). |
-| `OpenForWrite` | `func OpenForWrite(path string) (*GGUFWriter, error)` | Create a writer for the given file path. |
+| `Create` | `func Create(w io.Writer) *GGUFWriter` | Create a new GGUF writer wrapping any io.Writer or io.WriterAt (file, gzip stream, network buffer). If the writer implements io.WriterAt, writes go directly to it; otherwise data is buffered. |
+| `OpenForWrite` | `func OpenForWrite(path string) (*GGUFWriter, error)` | Create a writer for the given file path. Equivalent to `Create(os.File)` but manages the file handle internally until Close. Returns an error if the file cannot be opened. |
 | `(*GGUFWriter).SetKV()` | `func (w *GGUFWriter) SetKV(key string, v Value) error` | Add or replace a key-value pair in the metadata section. |
 | `(*GGUFWriter).GetMetadata()` | `func (w *GGUFWriter) GetMetadata() []KVEntry` | Return copies of all KV entries currently queued for writing. |
 | `(*GGUFWriter).AddTensor()` | `func (w *GGUFWriter) AddTensor(name string, shape []uint64, ggmlType GgmlType) uint64` | Queue a tensor definition; returns index for WriteTensorData/NewTensor. The reader is NOT consumed until Close(). |
-| `(*GGUFWriter).WriteTensorData()` | `func (w *GGUFWriter) WriteTensorData(idx uint64, r io.Reader) error` | Associate an io.Reader with the queued tensor at idx. Reader is deferred — bytes stream through 256 KB pooled buffer only during Close(). Memory usage O(1) regardless of tensor size. |
+| `(*GGUFWriter).WriteTensorData()` | `func (w *GGUFWriter) WriteTensorData(idx uint64, r io.Reader) error` | Associate an io.Reader with the queued tensor at idx. Reader is deferred — bytes stream to disk during Close(). Memory usage O(1) regardless of tensor size. |
 | `(*GGUFWriter).NewTensor()` | `func (w *GGUFWriter) NewTensor(name string, shape []uint64, ggmlType GgmlType, r io.Reader) error` | Convenience: combines AddTensor + WriteTensorData in one call with deferred consumption. |
 | `(*GGUFWriter).NumTensors()` | `func (w *GGUFWriter) NumTensors() int` | Return number of queued tensors. |
 | `(*GGUFWriter).Close()` | `func (w *GGUFWriter) Close() (int64, error)` | Flush header + KV section + tensor metadata and stream tensor data. Returns total bytes written. |
@@ -246,21 +256,20 @@ dst.Close()
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `StreamCopy` | `func StreamCopy(dst *GGUFWriter, src *GGUF, opts StreamOptions) error` | Copy tensors from source GGUF to writer with optional filtering and transformation. Passthrough copies stream directly without loading into memory; transforms/requantize require full data in memory. |
-| `StreamRequantize` | `func StreamRequantize(dst *GGUFWriter, src *GGUF, targetType GgmlType) error` | Copy and requantize all tensors from src to dst in one call. Requires full tensor data in memory for dequant/requant cycle. |
+| `StreamCopy` | `func StreamCopy(dst *GGUFWriter, src *GGUF, opts StreamOptions) error` | Copy tensors from source GGUF to writer with optional filtering and transformation. Passthrough copies stream directly without loading into memory; transforms require full data in memory. |
 | `StreamMerge` | `func StreamMerge(dst *GGUFWriter, sources []*GGUF, opts StreamOptions) error` | Merge tensors from multiple GGUF files into a single writer. KV metadata comes from the first source only. Later sources' metadata entries are skipped to avoid key conflicts. |
 
 ### Deferred-Consumption Streaming Writer
 
-The writer uses **deferred consumption** for tensor data — bytes are NOT loaded into memory when `AddTensor`/`WriteTensorData`/`NewTensor` is called. Instead, the underlying `io.Reader` reference is stored and streamed through a 256 KB pooled buffer only during `Close()`. This enables writing tensors larger than available RAM without allocation pressure.
+The writer uses **deferred consumption** for tensor data — bytes are NOT loaded into memory when `AddTensor`/`WriteTensorData`/`NewTensor` is called. Instead, the underlying `io.Reader` reference is stored and streamed during `Close()`. This enables writing tensors larger than available RAM without allocation pressure.
 
 **How it works:**
 1. Call `AddTensor(name, shape, type)` to queue tensor definition — returns index
 2. Call `WriteTensorData(idx, reader)` or `NewTensor(name, shape, type, reader)` with any `io.Reader` (network stream, file handle, byte buffer)
 3. The reader is NOT consumed at this point — only stored as a reference
-4. On `Close()`, the writer streams each tensor's bytes through a 256 KB pooled buffer directly to disk
+4. On `Close()`, the writer streams each tensor's bytes directly to disk
 
-**Memory efficiency:** RAM usage stays O(1) per in-flight tensor regardless of size (only the streaming window buffer + small struct overhead). A 10 GB tensor writes with ~256 KB peak memory, not 10 GB.
+**Memory efficiency:** RAM usage stays O(1) per in-flight tensor regardless of size. A 10 GB tensor writes with minimal peak memory, not 10 GB.
 
 ```go
 // Example: Stream a large tensor from a network connection without loading it into memory
@@ -278,23 +287,8 @@ nWritten, err := w.Close()  // Streams each tensor through ~256KB window to disk
 ```
 
 **Passthrough vs Transform paths:**
-- **Passthrough** (no transform/requantize): Source reader streams directly to writer via deferred consumption — zero-copy, O(1) memory
-- **Transform/Requantize**: Requires full data in memory for processing, then writes through normal streaming path
-
-### Metadata Operations
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `CopyMetadataLazy` | `func CopyMetadataLazy(dst *GGUFWriter, src *GGUF, include, exclude []string) error` | Copy KV entries from a lazy reader to a writer with pattern filtering. |
-| `MergeMetadataEntries` | `func MergeMetadataEntries(dst *GGUFWriter, src []KVEntry)` | Merge KV entries into the destination writer (overwrites existing keys). |
-| `FilterMetadataEntries` | `func FilterMetadataEntries(entries []KVEntry, pattern string) []KVEntry` | Return subset of KV entries matching a glob pattern. |
-
-### Dequantization / Requantization
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `Dequant` | `func Dequant(data []byte, t GgmlType) ([]float32, error)` | Convert quantized tensor data to float32 values. Supported: F32, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K. |
-| `Requantize` | `func Requantize(data []float32, targetType GgmlType) ([]byte, error)` | Convert float32 values to quantized raw bytes for the target type. |
+- **Passthrough** (no transform): Source reader streams directly to writer via deferred consumption — zero-copy, O(1) memory
+- **Transform**: Requires full data in memory for processing, then writes through normal streaming path
 
 ### Utilities
 
@@ -302,15 +296,6 @@ nWritten, err := w.Close()  // Streams each tensor through ~256KB window to disk
 |----------|-----------|-------------|
 | `ConvertName` | `func ConvertName(name string) string` | Translate tensor names from llama.cpp convention to HuggingFace convention (and vice versa). |
 | `MatchPattern` | `func MatchPattern(name string, patterns []string) bool` | Return true if name matches any of the given glob patterns. |
-
-### Kernel Cache Hints (Unix only)
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `HintSequential` | `func HintSequential(f *os.File, offset int64, count int64) error` | Mark file region for sequential access (FADV_SEQUENTIAL). |
-| `HintRandom` | `func HintRandom(f *os.File, offset int64, count int64) error` | Mark file region as random access (FADV_RANDOM). |
-| `HintDiscard` | `func HintDiscard(f *os.File, offset int64, length int64) error` | Release page cache for a file region (FADV_DONTNEED). |
-| `HintNoReuse` | `func HintNoReuse(f *os.File, offset int64, count int64) error` | Mark region as unlikely to be reused soon (FADV_NOREUSE). |
 
 ## Types
 
@@ -533,14 +518,7 @@ GOFLAGS="-buildvcs=false" go test ./gguf/... -v
 GOFLAGS="-buildvcs=false" go test ./gguf/... -short -v
 ```
 
-## Performance Notes
-
-- **Memory footprint**: `Open()` reads only 24 bytes (~56 bytes per GGUF struct). Metadata and tensor walks are lazy.
-- **IOPS cost**: `Metadata()` performs ONE seek to offset 24 + sequential KV walk. `Tensors()` performs ONE seek to kvEnd + N sequential reads for all tensors.
-- **Per-tensor cache**: First read into internal buffer; subsequent reads within same range hit cache (no disk seek). Cache released on `Close()`.
-- **Buffer pooling**: Package-level tiered sync.Pool reuses buffers across files/tensors (<64KB = smallPool, ≥1MB = largePool).
-
-## Architecture Decisions
+## Architecture Notes
 
 ### Lazy Loading Design
 
@@ -558,9 +536,18 @@ This design is ideal for:
 
 ### Multi-Shard Validation
 
-Multi-shard files undergo rigorous validation before combining:
+Multi-shard GGUF files undergo rigorous validation before combining:
 
-1. **Header validation**: Each shard must have valid GGUF v3 magic bytes
+1. **Header validation**: Each shard must have valid GGUF v3 magic bytes and consistent version
+2. **Naming convention enforcement**: All shards must follow `{basename}-{NNNNN}-of-{NNNNN}.gguf` pattern with matching basename (e.g., `TestModel-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf`)
+3. **Metadata consistency**: `split.no` and `split.count` values must match across all shards
+4. **Index validation**: Each shard's `split.no` must be in range [0, splitCount)
+5. **Sequence verification**: Shards are re-sorted by `split.no` to ensure correct order regardless of input order
+
+This prevents silent failures when:
+- Shards come from different directories or mounts (validated via metadata, not path)
+- Files are missing or corrupted
+- Metadata is inconsistent across shards
 2. **Metadata extraction**: `split.no`, `split.count`, and `general.architecture` are read from each shard's KV section
 3. **Cross-shard consistency**: All shards must agree on `split.count`; architecture must match if present in multiple shards
 4. **Sequence verification**: Shards are re-sorted by `split.no` to ensure correct order (0, 1, 2, ...) regardless of disk order

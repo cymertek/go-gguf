@@ -39,10 +39,10 @@ func TestMultiShardOrderValidation(t *testing.T) {
 		t.Fatalf("Failed to copy shard 1: %v", err)
 	}
 
-	// Open the first file (which is actually shard 3 in reverse order)
-	g, err := Open(destShard1)
+	// Pass shards in reverse order (3, 2, 1) to test that they get sorted correctly
+	g, err := NewReaderFile(destShard1, destShard2, destShard3)
 	if err != nil {
-		t.Fatalf("Failed to open split file: %v", err)
+		t.Fatalf("Failed to open split files: %v", err)
 	}
 	defer g.Close()
 
@@ -55,7 +55,7 @@ func TestMultiShardOrderValidation(t *testing.T) {
 		t.Fatal("SplitInfo should not be nil for split files")
 	}
 
-	// Verify shards are in correct order (0, 1, 2) after sorting
+	// Verify shards are in correct order (0, 1, 2) after sorting by split.no
 	expectedOrder := []int64{0, 1, 2}
 	for i, shard := range splitInfo.Shards {
 		if int64(shard.Index) != expectedOrder[i] {
@@ -109,12 +109,12 @@ func TestMultiShardMismatchedCount(t *testing.T) {
 		t.Fatalf("Failed to copy shard 1: %v", err)
 	}
 
-	// Try to open - should fail because we only have 2 files but metadata says 3
-	_, err = Open(destShard1)
+	// Try to open with mismatched split counts (one says 3, other says 2)
+	_, err = NewReaderFile(destShard1, destShard2)
 	if err == nil {
-		t.Error("Expected error for incomplete shard set, got nil")
-	} else if !contains(err.Error(), "expected at least 3 shards") && !contains(err.Error(), "missing shard") {
-		t.Errorf("Error should mention missing/incomplete shards, got: %v", err)
+		t.Error("Expected error for mismatched shard counts, got nil")
+	} else if !contains(err.Error(), "split.count") && !contains(err.Error(), "mismatch") {
+		t.Errorf("Error should mention split count mismatch, got: %v", err)
 	}
 }
 
@@ -131,7 +131,7 @@ func TestMultiShardMissingShard(t *testing.T) {
 	}
 	defer os.RemoveAll(tmpDir)
 
-	// Copy only 2 out of 3 shards
+	// Copy only 2 out of 3 shards — user must pass all explicitly
 	shard1 := "/workdir/TestModel-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf"
 	destShard1 := filepath.Join(tmpDir, "model-00001-of-00003.gguf")
 	destShard2 := filepath.Join(tmpDir, "model-00002-of-00003.gguf")
@@ -143,12 +143,12 @@ func TestMultiShardMissingShard(t *testing.T) {
 		t.Fatalf("Failed to copy shard 1: %v", err)
 	}
 
-	// Try to open - should fail because shard 3 is missing
-	_, err = Open(destShard1)
+	// Try to open with incomplete set (only 2 of 3 shards passed explicitly)
+	_, err = NewReaderFile(destShard1, destShard2)
 	if err == nil {
-		t.Error("Expected error for missing shard, got nil")
-	} else if !contains(err.Error(), "missing shard") && !contains(err.Error(), "expected at least") {
-		t.Errorf("Error should mention missing shard, got: %v", err)
+		t.Error("Expected error for incomplete shard set, got nil")
+	} else if !contains(err.Error(), "split.count") && !contains(err.Error(), "expected 3 shards") && !contains(err.Error(), "mismatched filename") {
+		t.Errorf("Error should mention missing/incomplete shards or filename mismatch, got: %v", err)
 	}
 }
 

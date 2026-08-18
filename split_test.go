@@ -12,15 +12,24 @@ func TestMultiShardSplit(t *testing.T) {
 		t.Skip("skipping multi-shard test in short mode")
 	}
 
-	// Use TestModel-V4 split files as test data
-	shard1Path := "/workdir/TestModel-V4-Flash-0731-UD-IQ1_S-00001-of-00003.gguf"
-	if _, err := os.Stat(shard1Path); os.IsNotExist(err) {
-		t.Skip("TestModel-V4 split files not found, skipping test")
+	// Use TestModel-V4 split files as test data — pass all shards explicitly (no auto-detection)
+	basePath := "/workdir/TestModel-V4-Flash-0731-UD-IQ1_S"
+	shardPaths := []string{
+		fmt.Sprintf("%s-00001-of-00003.gguf", basePath),
+		fmt.Sprintf("%s-00002-of-00003.gguf", basePath),
+		fmt.Sprintf("%s-00003-of-00003.gguf", basePath),
 	}
 
-	g, err := Open(shard1Path)
+	// Verify all shard files exist
+	for _, path := range shardPaths {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			t.Skipf("Split file not found: %s, skipping test", path)
+		}
+	}
+
+	g, err := NewReaderFile(shardPaths...)
 	if err != nil {
-		t.Fatalf("Failed to open split file: %v", err)
+		t.Fatalf("Failed to open split files: %v", err)
 	}
 	defer g.Close()
 

@@ -41,9 +41,9 @@ func TestRoundTrip(t *testing.T) {
 	}
 
 	// Read back using new API
-	g, err := NewReader(tmpFile)
+	g, err := NewReaderFile(tmpFile)
 	if err != nil {
-		t.Fatalf("NewReader: %v", err)
+		t.Fatalf("NewReaderFile: %v", err)
 	}
 	defer g.Close()
 

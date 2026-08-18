@@ -39,7 +39,7 @@ type StreamOptions struct {
 //
 // Example -- copy all weight tensors with filtering:
 //
-//	src, err := gguf.Open("model.gguf")
+//	src, err := gguf.NewReaderFile("model.gguf")
 //	if err != nil { log.Fatal(err) }
 //	defer src.Close()
 //	dst := gguf.Create(os.Stdout)
@@ -102,8 +102,8 @@ func StreamCopy(dst *GGUFWriter, src *GGUF, opts StreamOptions) error {
 //
 // Example -- merge two split shards into one file:
 //
-//	s1, _ := gguf.Open("shard-00001-of-00002.gguf")
-//	s2, _ := gguf.Open("shard-00002-of-00002.gguf")
+//	s1, _ := gguf.NewReaderFile("shard-00001-of-00002.gguf")
+//	s2, _ := gguf.NewReaderFile("shard-00002-of-00002.gguf")
 //	defer s1.Close(); defer s2.Close()
 //	dst := gguf.Create(os.Stdout)
 //	err := gguf.StreamMerge(dst, []*gguf.GGUF{s1, s2}, gguf.StreamOptions{})
